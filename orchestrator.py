@@ -39,9 +39,27 @@ Please consult your doctor for all treatment decisions.
 EMERGENCY: Call 115 (VN) / 911 (US)"""
 
 
+NEED_MORE_INFO_TAG = "[NEED_MORE_INFO]"
+
+
 def _call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 4000) -> str:
-    """Call Claude Code CLI in print mode."""
-    full_prompt = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{user_prompt}"
+    """Call Claude Code CLI in print mode.
+
+    System prompt includes instruction: if more info needed from patient,
+    output [NEED_MORE_INFO] followed by the question. This replaces
+    AskUserQuestion which only works in interactive terminal.
+    """
+    extra_instruction = (
+        "\n\n## QUAN TRONG - Tuong tac voi benh nhan\n"
+        "Ban dang chay trong che do tu dong (KHONG co terminal).\n"
+        "- KHONG BAO GIO dung tool AskUserQuestion.\n"
+        "- Neu can hoi them benh nhan de phan tich tot hon, "
+        f"bat dau response voi {NEED_MORE_INFO_TAG} roi ghi cau hoi.\n"
+        f"Vi du: {NEED_MORE_INFO_TAG} Ban co the cho biet ket qua xet nghiem gan day?\n"
+        "- Neu KHONG can hoi them, phan tich binh thuong."
+    )
+
+    full_prompt = f"[SYSTEM]\n{system_prompt}{extra_instruction}\n\n[USER]\n{user_prompt}"
 
     cmd = [
         CLAUDE_BIN,
@@ -49,6 +67,7 @@ def _call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 4000) -
         "--model", MODEL,
         "--no-session-persistence",
         "--output-format", "text",
+        "--allowedTools", "",  # No interactive tools allowed
     ]
 
     try:
@@ -56,14 +75,14 @@ def _call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 4000) -
             cmd,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=300,
             cwd=str(Path(__file__).parent),
         )
         if result.returncode != 0:
             raise RuntimeError(f"Claude CLI error: {result.stderr[:500]}")
         return result.stdout.strip()
     except subprocess.TimeoutExpired:
-        raise RuntimeError("Claude CLI timed out (120s)")
+        raise RuntimeError("Claude CLI timed out (300s)")
 
 
 class HealthOrchestrator:
@@ -73,6 +92,7 @@ class HealthOrchestrator:
     STEP_NAMES = {
         "emergency_check": "Kiểm tra khẩn cấp",
         "intake": "Thu thập thông tin bệnh nhân",
+        "interview": "Hỏi thêm thông tin",
         "research": "Tra cứu tài liệu y khoa",
         "eval": "Đánh giá tình trạng",
         "causes": "Phân tích nguyên nhân",
@@ -80,6 +100,8 @@ class HealthOrchestrator:
         "synthesis": "Tổng hợp báo cáo",
         "handoff": "Chuẩn bị kết quả tư vấn",
     }
+
+    MAX_INTERVIEW_TURNS = 3  # Max follow-up questions before proceeding
 
     def __init__(self, user_id: int = None, patient_id: int = None,
                  on_step_start=None, on_step_done=None):
@@ -99,6 +121,10 @@ class HealthOrchestrator:
             "report": None,
             "handoff": None,
         }
+        self.interview_history = []  # conversation turns for intake
+        self.interview_turn = 0
+        self._analysis_resume_step = "research"  # for resuming after clarification
+        self._analysis_pending_question_step = None
 
     def _notify(self, step: str, event: str = "start"):
         """Notify progress via callback."""
@@ -111,36 +137,43 @@ class HealthOrchestrator:
         except Exception:
             pass  # Don't let notification errors break the workflow
 
-    def start_consultation(self, patient_message: str) -> dict:
-        """Run full 8-step consultation from patient message."""
+    def start_intake(self, patient_message: str) -> dict:
+        """Phase 1: Emergency check + first interview question.
+
+        Returns:
+            dict with keys:
+                - "emergency": True if emergency detected
+                - "needs_interview": True if bot should ask user follow-up
+                - "question": the follow-up question to ask user
+                - "consultation_id": for tracking
+                - Or full result if interview not needed
+        """
         consultation_id = f"c_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.consultation["id"] = consultation_id
         self.consultation["started_at"] = datetime.now().isoformat()
 
         # Create consultation record in DB
-        db_consultation = None
         if self.user_id:
-            db_consultation = db.create_consultation(
+            self._db_consultation = db.create_consultation(
                 consultation_id=consultation_id,
                 user_id=self.user_id,
                 patient_id=self.patient_id,
                 raw_message=patient_message,
             )
-            # Save user message
             db.save_message(
                 user_id=self.user_id,
                 role="user",
                 content=patient_message,
-                consultation_id=db_consultation["id"],
+                consultation_id=self._db_consultation["id"],
             )
-
-        steps = {}
+        else:
+            self._db_consultation = None
 
         # Step 0: Emergency Check
         self._notify("emergency_check", "start")
         emergency = self._check_emergency(patient_message)
         if emergency["is_emergency"]:
-            if db_consultation:
+            if self._db_consultation:
                 db.update_consultation(
                     consultation_id,
                     is_emergency=1,
@@ -151,99 +184,386 @@ class HealthOrchestrator:
                 "id": consultation_id,
                 "emergency": True,
                 "message": emergency["message"],
-                "steps_completed": ["emergency_check"],
             }
-        steps["emergency_check"] = "passed"
         self._notify("emergency_check", "done")
 
-        # Step 1: Quick Intake (from message directly, no interview)
-        self._notify("intake", "start")
-        profile = self._quick_intake(patient_message)
-        self.consultation["patient_profile"] = profile
-        steps["intake"] = "done"
-        if db_consultation:
-            db.update_consultation(consultation_id, patient_profile=profile.get("extracted", ""))
-        self._notify("intake", "done")
+        # Step 1: Interview - ask Claude to interview the patient
+        self._notify("interview", "start")
+        self.interview_history = [{"role": "user", "content": patient_message}]
+        self.interview_turn = 0
 
-        # Step 2: Research
-        self._notify("research", "start")
-        research_result = self._run_research(profile)
-        self.consultation["research_findings"] = research_result
-        steps["research"] = "done"
-        if db_consultation:
-            db.update_consultation(consultation_id, research_findings=research_result)
-        self._notify("research", "done")
+        question = self._interview_step(patient_message)
 
-        # Step 3: Status Assessment
-        self._notify("eval", "start")
-        eval_result = self._run_eval(profile, research_result)
-        self.consultation["status_assessment"] = eval_result
-        steps["eval"] = "done"
-        if db_consultation:
-            db.update_consultation(consultation_id, status_assessment=eval_result)
-        self._notify("eval", "done")
+        if question:
+            # Claude wants to ask follow-up questions
+            self.interview_history.append({"role": "assistant", "content": question})
+            if self._db_consultation:
+                db.save_message(
+                    user_id=self.user_id,
+                    role="assistant",
+                    content=question,
+                    consultation_id=self._db_consultation["id"],
+                )
+            return {
+                "id": consultation_id,
+                "emergency": False,
+                "needs_interview": True,
+                "question": question,
+                "consultation_id": consultation_id,
+            }
+        else:
+            # Enough info from first message - proceed directly
+            return self._run_analysis_phase()
 
-        # Step 4: Cause Analysis
-        self._notify("causes", "start")
-        causes_result = self._run_causes(profile, research_result)
-        self.consultation["causal_analysis"] = causes_result
-        steps["causes"] = "done"
-        if db_consultation:
-            db.update_consultation(consultation_id, causal_analysis=causes_result)
-        self._notify("causes", "done")
+    def continue_interview(self, user_reply: str) -> dict:
+        """Phase 1 continued: Process user's reply to interview question.
 
-        # Step 5: Solutions
-        self._notify("solutions", "start")
-        solutions_result = self._run_solutions(
-            profile, research_result, eval_result, causes_result
+        Returns same format as start_intake.
+        """
+        self.interview_turn += 1
+        self.interview_history.append({"role": "user", "content": user_reply})
+
+        if self._db_consultation:
+            db.save_message(
+                user_id=self.user_id,
+                role="user",
+                content=user_reply,
+                consultation_id=self._db_consultation["id"],
+            )
+
+        # Check if max turns reached - if so, proceed with what we have
+        if self.interview_turn >= self.MAX_INTERVIEW_TURNS:
+            self._notify("interview", "done")
+            return self._run_analysis_phase()
+
+        question = self._interview_step(user_reply)
+
+        if question:
+            self.interview_history.append({"role": "assistant", "content": question})
+            if self._db_consultation:
+                db.save_message(
+                    user_id=self.user_id,
+                    role="assistant",
+                    content=question,
+                    consultation_id=self._db_consultation["id"],
+                )
+            return {
+                "id": self.consultation["id"],
+                "emergency": False,
+                "needs_interview": True,
+                "question": question,
+                "consultation_id": self.consultation["id"],
+            }
+        else:
+            self._notify("interview", "done")
+            return self._run_analysis_phase()
+
+    def _interview_step(self, latest_message: str) -> str | None:
+        """Ask Claude consultant to either ask a follow-up or signal INTAKE_COMPLETE.
+
+        Returns: follow-up question string, or None if intake is complete.
+        """
+        # Build conversation context
+        convo_text = ""
+        for msg in self.interview_history:
+            role_label = "Benh nhan" if msg["role"] == "user" else "Jiva Health"
+            convo_text += f"{role_label}: {msg['content']}\n\n"
+
+        # Patient context from DB
+        patient_context = ""
+        if self.patient_id:
+            patient = db.get_patient(self.patient_id)
+            if patient:
+                patient_context = (
+                    f"\nThong tin benh nhan da biet:\n"
+                    f"- Ten: {patient.get('name', 'N/A')}\n"
+                    f"- Tuoi: {patient.get('age', 'N/A')}\n"
+                    f"- Gioi: {patient.get('gender', 'N/A')}\n"
+                    f"- Tien su: {patient.get('medical_history', 'N/A')}\n"
+                    f"- Di ung: {patient.get('allergies', 'N/A')}\n"
+                    f"- Thuoc hien tai: {patient.get('current_medications', 'N/A')}\n"
+                )
+
+        response = _call_claude(
+            system_prompt=(
+                f"{consultant.SYSTEM_PROMPT}\n\n"
+                "## Luu y QUAN TRONG\n"
+                "- Xung ho Toi/Ban (KHONG dung con/thay)\n"
+                "- Neu DA DU thong tin (trieu chung, thoi gian, muc do, tien su co ban): "
+                "bat dau response voi [INTAKE_COMPLETE] roi xuat YAML profile.\n"
+                "- Neu CHUA DU: hoi them 1-2 cau ngan gon, than thien. "
+                "KHONG hoi kieu checklist. Hoi TU NHIEN nhu bac si.\n"
+                f"- Day la luot hoi thu {self.interview_turn + 1}/{self.MAX_INTERVIEW_TURNS}. "
+                f"{'Neu la luot cuoi, hay ket thuc voi [INTAKE_COMPLETE].' if self.interview_turn + 1 >= self.MAX_INTERVIEW_TURNS else ''}"
+            ),
+            user_prompt=(
+                f"{patient_context}\n"
+                f"Cuoc hoi thoai:\n{convo_text}\n"
+                "Tiep tuc hoi thoai hoac [INTAKE_COMPLETE] neu du thong tin."
+            ),
         )
-        self.consultation["solutions"] = solutions_result
-        steps["solutions"] = "done"
-        if db_consultation:
-            db.update_consultation(consultation_id, solutions=solutions_result)
-        self._notify("solutions", "done")
 
-        # Step 6: Synthesis - Generate Report
-        self._notify("synthesis", "start")
-        report = self._synthesize_report()
-        self.consultation["report"] = report
-        steps["synthesis"] = "done"
-        self._notify("synthesis", "done")
+        if "[INTAKE_COMPLETE]" in response:
+            # Extract profile and store
+            self.consultation["patient_profile"] = {
+                "raw_message": self.interview_history[0]["content"],
+                "extracted": response,
+                "full_conversation": convo_text,
+            }
+            if self._db_consultation:
+                db.update_consultation(
+                    self.consultation["id"],
+                    patient_profile=response,
+                )
+            return None
+        else:
+            return response
 
-        # Step 7: Handoff - Summary & Teach-back
-        self._notify("handoff", "start")
-        handoff = self._generate_handoff()
-        self.consultation["handoff"] = handoff
-        steps["handoff"] = "done"
-        self._notify("handoff", "done")
+    def _check_need_more_info(self, result: str) -> tuple[bool, str, str]:
+        """Check if agent output contains [NEED_MORE_INFO] tag.
+
+        Returns: (needs_info, question, clean_result)
+        """
+        if NEED_MORE_INFO_TAG in result:
+            # Extract the question after the tag
+            parts = result.split(NEED_MORE_INFO_TAG, 1)
+            question = parts[1].strip()
+            return True, question, parts[0].strip()
+        return False, "", result
+
+    def _run_analysis_phase(self) -> dict:
+        """Phase 2: Run Steps 2-7 (research through handoff) after intake is complete.
+
+        If any agent needs more info from the patient, returns with
+        needs_clarification=True so the bot can ask the user and resume later.
+        """
+        consultation_id = self.consultation["id"]
+        steps = {"emergency_check": "passed", "intake": "done"}
+
+        # If profile not yet extracted (direct proceed), do quick intake
+        if not self.consultation.get("patient_profile"):
+            self._notify("intake", "start")
+            all_messages = " ".join(
+                msg["content"] for msg in self.interview_history if msg["role"] == "user"
+            )
+            profile = self._quick_intake(all_messages)
+            self.consultation["patient_profile"] = profile
+            if self._db_consultation:
+                db.update_consultation(consultation_id, patient_profile=profile.get("extracted", ""))
+            self._notify("intake", "done")
+
+        profile = self.consultation["patient_profile"]
+
+        # Resume from where we left off (if continuing after clarification)
+        start_step = self._analysis_resume_step or "research"
+
+        analysis_steps = [
+            ("research", self._step_research, profile),
+            ("eval", self._step_eval, profile),
+            ("causes", self._step_causes, profile),
+            ("solutions", self._step_solutions, profile),
+            ("synthesis", self._step_synthesis, None),
+            ("handoff", self._step_handoff, None),
+        ]
+
+        started = False
+        for step_name, step_fn, step_arg in analysis_steps:
+            if not started:
+                if step_name == start_step:
+                    started = True
+                else:
+                    # Already completed step
+                    steps[step_name] = "done"
+                    continue
+
+            self._notify(step_name, "start")
+            result_text = step_fn(step_arg) if step_arg is not None else step_fn()
+
+            # Check if agent needs more info from patient
+            needs_info, question, clean_result = self._check_need_more_info(result_text)
+            if needs_info:
+                # Save progress so we can resume after user replies
+                self._analysis_resume_step = step_name
+                self._analysis_pending_question_step = step_name
+                if self._db_consultation:
+                    db.save_message(
+                        user_id=self.user_id,
+                        role="assistant",
+                        content=question,
+                        consultation_id=self._db_consultation["id"],
+                    )
+                return {
+                    "id": consultation_id,
+                    "emergency": False,
+                    "needs_interview": False,
+                    "needs_clarification": True,
+                    "clarification_question": question,
+                    "clarification_step": step_name,
+                    "consultation_id": consultation_id,
+                }
+
+            # Store result
+            self._store_step_result(step_name, result_text)
+            steps[step_name] = "done"
+            if self._db_consultation:
+                self._db_save_step(consultation_id, step_name, result_text)
+            self._notify(step_name, "done")
 
         # Save report to file
-        report_path = self._save_report(consultation_id, report)
+        report_path = self._save_report(consultation_id, self.consultation["report"])
 
         # Update DB with final results
-        if db_consultation:
+        if self._db_consultation:
             db.update_consultation(
                 consultation_id,
-                report=report,
-                handoff=handoff,
+                report=self.consultation["report"],
+                handoff=self.consultation["handoff"],
                 status="completed",
                 completed_at=datetime.now().isoformat(),
             )
             db.save_message(
                 user_id=self.user_id,
                 role="assistant",
-                content=handoff,
-                consultation_id=db_consultation["id"],
+                content=self.consultation["handoff"],
+                consultation_id=self._db_consultation["id"],
             )
 
         return {
             "id": consultation_id,
             "emergency": False,
+            "needs_interview": False,
+            "needs_clarification": False,
             "steps_completed": list(steps.keys()),
-            "report": report,
-            "handoff": handoff,
+            "report": self.consultation["report"],
+            "handoff": self.consultation["handoff"],
             "report_path": str(report_path),
         }
+
+    def continue_after_clarification(self, user_reply: str) -> dict:
+        """Resume analysis after user answered a clarification question.
+
+        Adds the user's reply to the interview history (so subsequent agents
+        can see it) and re-runs the step that asked for clarification.
+        """
+        self.interview_history.append({"role": "user", "content": user_reply})
+        if self._db_consultation:
+            db.save_message(
+                user_id=self.user_id,
+                role="user",
+                content=user_reply,
+                consultation_id=self._db_consultation["id"],
+            )
+
+        # Update profile with additional info
+        profile = self.consultation.get("patient_profile", {})
+        if isinstance(profile, dict):
+            extra = profile.get("extra_info", [])
+            extra.append(user_reply)
+            profile["extra_info"] = extra
+            self.consultation["patient_profile"] = profile
+
+        # Resume analysis from the step that asked
+        return self._run_analysis_phase()
+
+    def _step_research(self, profile):
+        return self._run_research(profile)
+
+    def _step_eval(self, profile):
+        return self._run_eval(
+            profile,
+            self.consultation.get("research_findings", ""),
+        )
+
+    def _step_causes(self, profile):
+        return self._run_causes(
+            profile,
+            self.consultation.get("research_findings", ""),
+        )
+
+    def _step_solutions(self, profile):
+        return self._run_solutions(
+            profile,
+            self.consultation.get("research_findings", ""),
+            self.consultation.get("status_assessment", ""),
+            self.consultation.get("causal_analysis", ""),
+        )
+
+    def _step_synthesis(self):
+        return self._synthesize_report()
+
+    def _step_handoff(self):
+        return self._generate_handoff()
+
+    def _store_step_result(self, step_name: str, result: str):
+        """Store step result in consultation dict."""
+        mapping = {
+            "research": "research_findings",
+            "eval": "status_assessment",
+            "causes": "causal_analysis",
+            "solutions": "solutions",
+            "synthesis": "report",
+            "handoff": "handoff",
+        }
+        key = mapping.get(step_name)
+        if key:
+            self.consultation[key] = result
+
+    def _db_save_step(self, consultation_id: str, step_name: str, result: str):
+        """Save step result to database."""
+        mapping = {
+            "research": "research_findings",
+            "eval": "status_assessment",
+            "causes": "causal_analysis",
+            "solutions": "solutions",
+        }
+        field = mapping.get(step_name)
+        if field:
+            db.update_consultation(consultation_id, **{field: result})
+
+    def start_consultation(self, patient_message: str) -> dict:
+        """Legacy: Run full 8-step consultation without interactive interview.
+        Kept for backward compatibility (CLI usage, etc.)."""
+        consultation_id = f"c_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.consultation["id"] = consultation_id
+        self.consultation["started_at"] = datetime.now().isoformat()
+
+        if self.user_id:
+            self._db_consultation = db.create_consultation(
+                consultation_id=consultation_id,
+                user_id=self.user_id,
+                patient_id=self.patient_id,
+                raw_message=patient_message,
+            )
+            db.save_message(
+                user_id=self.user_id, role="user", content=patient_message,
+                consultation_id=self._db_consultation["id"],
+            )
+        else:
+            self._db_consultation = None
+
+        # Emergency check
+        self._notify("emergency_check", "start")
+        emergency = self._check_emergency(patient_message)
+        if emergency["is_emergency"]:
+            if self._db_consultation:
+                db.update_consultation(
+                    consultation_id, is_emergency=1, status="emergency",
+                    completed_at=datetime.now().isoformat(),
+                )
+            return {"id": consultation_id, "emergency": True, "message": emergency["message"],
+                    "steps_completed": ["emergency_check"]}
+        self._notify("emergency_check", "done")
+
+        # Quick intake (no interview)
+        self._notify("intake", "start")
+        profile = self._quick_intake(patient_message)
+        self.consultation["patient_profile"] = profile
+        if self._db_consultation:
+            db.update_consultation(consultation_id, patient_profile=profile.get("extracted", ""))
+        self._notify("intake", "done")
+
+        self.interview_history = [{"role": "user", "content": patient_message}]
+        return self._run_analysis_phase()
 
     def _check_emergency(self, message: str) -> dict:
         """Step 0: Emergency keyword check."""

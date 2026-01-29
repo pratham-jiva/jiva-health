@@ -44,7 +44,7 @@ SUPER_ADMINS = {
     "passanta": "super_admin",  # Trương Hồng Hạnh
 }
 
-# Active sessions: telegram_id -> {user, patient, state}
+# Active sessions: telegram_id -> {user, patient, state, orchestrator, ...}
 user_sessions: dict[int, dict] = {}
 
 
@@ -248,7 +248,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle patient messages - run consultation."""
+    """Handle patient messages - interactive consultation with interview."""
     session = _get_session(update.effective_user)
     user = session["user"]
     message = update.message.text
@@ -270,6 +270,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    # Handle interview reply - user is answering a follow-up question
+    if session.get("state") == "interviewing":
+        await _handle_interview_reply(update, context, session, message)
+        return
+
+    # Handle clarification reply - agent asked for more info during analysis
+    if session.get("state") == "clarifying":
+        await _handle_clarification_reply(update, context, session, message)
+        return
+
     # Ensure we have a patient
     if not session.get("patient"):
         default = db.get_default_patient(user["id"])
@@ -286,29 +296,137 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Save user message
     db.save_message(user_id=user["id"], role="user", content=message)
 
-    # Notify processing
+    # Show initial processing message
     processing_msg = await update.message.reply_text(
-        f"Đang tư vấn cho {patient['name']}...\n"
-        "Bước 1/7: Kiểm tra khẩn cấp..."
+        f"Đang tiếp nhận thông tin từ {patient['name']}...\n"
+        "🔍 Kiểm tra khẩn cấp..."
     )
 
-    # Progress callback - updates the processing message with current step
+    chat_id = update.effective_chat.id
+    msg_id = processing_msg.message_id
+    loop = asyncio.get_event_loop()
+
+    def _on_step_start(step_name: str, step_desc: str):
+        icon = STEP_ICONS.get(step_name, "⏳")
+        text = f"🔍 {icon} {step_desc}..."
+        try:
+            asyncio.run_coroutine_threadsafe(
+                context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg_id, text=text
+                ),
+                loop,
+            ).result(timeout=5)
+        except Exception:
+            pass
+
+    try:
+        # Create orchestrator and start intake (Phase 1)
+        orchestrator = HealthOrchestrator(
+            user_id=user["id"],
+            patient_id=patient["id"],
+            on_step_start=_on_step_start,
+        )
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, orchestrator.start_intake, message
+        )
+
+        if result.get("emergency"):
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id, text=result["message"],
+            )
+            return
+
+        if result.get("needs_interview"):
+            # Bot needs to ask follow-up questions
+            # Delete the processing message and send the question naturally
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except Exception:
+                pass
+
+            await update.message.reply_text(result["question"])
+
+            # Store orchestrator in session for continuing later
+            session["state"] = "interviewing"
+            session["orchestrator"] = orchestrator
+            session["consultation_id"] = result["consultation_id"]
+            return
+
+        if result.get("needs_clarification"):
+            # Agent needs more info from patient during analysis
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except Exception:
+                pass
+
+            question = result["clarification_question"]
+            step = result.get("clarification_step", "")
+            step_desc = HealthOrchestrator.STEP_NAMES.get(step, step)
+            await update.message.reply_text(
+                f"[{step_desc}]\n{question}"
+            )
+
+            session["state"] = "clarifying"
+            session["orchestrator"] = orchestrator
+            session["consultation_id"] = result["consultation_id"]
+            return
+
+        # No interview needed - already got full result
+        await _send_consultation_result(update, context, result, chat_id, msg_id, patient)
+
+    except Exception as e:
+        logger.error(f"Consultation error for user {user['id']}: {e}")
+        session["state"] = "idle"
+        session.pop("orchestrator", None)
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=msg_id,
+            text=(
+                "Xin lỗi, đã có lỗi xảy ra trong quá trình tư vấn. "
+                "Vui lòng thử lại sau.\n\n"
+                "Nếu khẩn cấp, vui lòng gọi 115 (VN) / 911 (US)."
+            ),
+        )
+
+
+STEP_ICONS = {
+    "emergency_check": "🔍",
+    "intake": "📋",
+    "interview": "💬",
+    "research": "📚",
+    "eval": "🔬",
+    "causes": "🔎",
+    "solutions": "💊",
+    "synthesis": "📝",
+    "handoff": "✅",
+}
+
+
+async def _handle_interview_reply(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+    session: dict, message: str
+) -> None:
+    """Handle user's reply during interactive interview."""
+    user = session["user"]
+    patient = session["patient"]
+    orchestrator = session.get("orchestrator")
+
+    if not orchestrator:
+        # Lost orchestrator (e.g., bot restarted) - restart consultation
+        session["state"] = "idle"
+        await update.message.reply_text(
+            "Phiên tư vấn bị gián đoạn. Vui lòng gửi lại mô tả triệu chứng."
+        )
+        return
+
+    # Show "thinking" indicator
+    processing_msg = await update.message.reply_text("💬 Đang xem xét thông tin...")
+
     chat_id = update.effective_chat.id
     msg_id = processing_msg.message_id
     loop = asyncio.get_event_loop()
     total_steps = 7
     step_counter = {"current": 0}
-
-    STEP_ICONS = {
-        "emergency_check": "🔍",
-        "intake": "📋",
-        "research": "📚",
-        "eval": "🔬",
-        "causes": "🔎",
-        "solutions": "💊",
-        "synthesis": "📝",
-        "handoff": "✅",
-    }
 
     def _on_step_start(step_name: str, step_desc: str):
         step_counter["current"] += 1
@@ -316,7 +434,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         icon = STEP_ICONS.get(step_name, "⏳")
         progress_bar = "▓" * n + "░" * (total_steps - n)
         text = (
-            f"Đang tư vấn cho {patient['name']}...\n"
+            f"Đang phân tích cho {patient['name']}...\n"
             f"[{progress_bar}] {n}/{total_steps}\n"
             f"{icon} {step_desc}..."
         )
@@ -330,64 +448,173 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception:
             pass
 
+    # Update orchestrator's progress callback for analysis phase
+    orchestrator.on_step_start = _on_step_start
+
     try:
-        # Run consultation in thread pool with progress callbacks
-        orchestrator = HealthOrchestrator(
-            user_id=user["id"],
-            patient_id=patient["id"],
-            on_step_start=_on_step_start,
-        )
         result = await asyncio.get_event_loop().run_in_executor(
-            None, orchestrator.start_consultation, message
+            None, orchestrator.continue_interview, message
         )
 
-        if result.get("emergency"):
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=msg_id,
-                text=result["message"],
-            )
+        if result.get("needs_interview"):
+            # Still interviewing - send next question
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except Exception:
+                pass
+            await update.message.reply_text(result["question"])
             return
 
-        # Send handoff (short summary) first
-        handoff = result.get("handoff", "")
-        if handoff:
-            if len(handoff) > 4000:
-                handoff = handoff[:4000] + "\n\n... (xem báo cáo đầy đủ qua web)"
+        if result.get("needs_clarification"):
+            # Agent needs more info during analysis
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except Exception:
+                pass
 
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=msg_id,
-                text=handoff,
-            )
-        else:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=msg_id,
-                text="Đã hoàn thành tư vấn. Dùng /report để xem báo cáo chi tiết.",
-            )
-
-        # Send report link
-        report_path = result.get("report_path", "")
-        if report_path:
-            report_id = Path(report_path).stem
+            question = result["clarification_question"]
+            step = result.get("clarification_step", "")
+            step_desc = HealthOrchestrator.STEP_NAMES.get(step, step)
             await update.message.reply_text(
-                f"Báo cáo chi tiết:\n"
-                f"http://{WEB_HOST}:{WEB_PORT}/report/{report_id}\n\n"
-                f"Bệnh nhân: {patient['name']}\n"
-                "Lưu ý: Thông tin chỉ mang tính tham khảo."
+                f"[{step_desc}]\n{question}"
             )
+
+            session["state"] = "clarifying"
+            # Keep orchestrator in session
+            return
+
+        # Interview done - analysis running/complete
+        session["state"] = "idle"
+        session.pop("orchestrator", None)
+        await _send_consultation_result(update, context, result, chat_id, msg_id, patient)
 
     except Exception as e:
-        logger.error(f"Consultation error for user {user['id']}: {e}")
+        logger.error(f"Interview continuation error: {e}")
+        session["state"] = "idle"
+        session.pop("orchestrator", None)
         await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=msg_id,
+            chat_id=chat_id, message_id=msg_id,
             text=(
-                "Xin lỗi, đã có lỗi xảy ra trong quá trình tư vấn. "
-                "Vui lòng thử lại sau.\n\n"
-                "Nếu khẩn cấp, vui lòng gọi 115 (VN) / 911 (US)."
+                "Xin lỗi, đã có lỗi xảy ra. Vui lòng thử lại.\n\n"
+                "Nếu khẩn cấp: Gọi 115 (VN) / 911 (US)."
             ),
+        )
+
+
+async def _handle_clarification_reply(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+    session: dict, message: str
+) -> None:
+    """Handle user's reply to a clarification question from an analysis agent."""
+    user = session["user"]
+    patient = session["patient"]
+    orchestrator = session.get("orchestrator")
+
+    if not orchestrator:
+        session["state"] = "idle"
+        await update.message.reply_text(
+            "Phiên tư vấn bị gián đoạn. Vui lòng gửi lại mô tả triệu chứng."
+        )
+        return
+
+    # Show processing indicator
+    processing_msg = await update.message.reply_text("Cảm ơn! Đang tiếp tục phân tích...")
+
+    chat_id = update.effective_chat.id
+    msg_id = processing_msg.message_id
+    loop = asyncio.get_event_loop()
+    total_steps = 7
+    step_counter = {"current": 0}
+
+    def _on_step_start(step_name: str, step_desc: str):
+        step_counter["current"] += 1
+        n = step_counter["current"]
+        icon = STEP_ICONS.get(step_name, "")
+        progress_bar = ">" * n + "." * (total_steps - n)
+        text = (
+            f"Dang phan tich cho {patient['name']}...\n"
+            f"[{progress_bar}] {n}/{total_steps}\n"
+            f"{icon} {step_desc}..."
+        )
+        try:
+            asyncio.run_coroutine_threadsafe(
+                context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg_id, text=text
+                ),
+                loop,
+            ).result(timeout=5)
+        except Exception:
+            pass
+
+    orchestrator.on_step_start = _on_step_start
+
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, orchestrator.continue_after_clarification, message
+        )
+
+        if result.get("needs_clarification"):
+            # Another agent also needs more info
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except Exception:
+                pass
+
+            question = result["clarification_question"]
+            step = result.get("clarification_step", "")
+            step_desc = HealthOrchestrator.STEP_NAMES.get(step, step)
+            await update.message.reply_text(
+                f"[{step_desc}]\n{question}"
+            )
+            # Stay in clarifying state
+            return
+
+        # Analysis complete
+        session["state"] = "idle"
+        session.pop("orchestrator", None)
+        await _send_consultation_result(update, context, result, chat_id, msg_id, patient)
+
+    except Exception as e:
+        logger.error(f"Clarification continuation error: {e}")
+        session["state"] = "idle"
+        session.pop("orchestrator", None)
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=msg_id,
+            text=(
+                "Xin loi, da co loi xay ra. Vui long thu lai.\n\n"
+                "Neu khan cap: Goi 115 (VN) / 911 (US)."
+            ),
+        )
+
+
+async def _send_consultation_result(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+    result: dict, chat_id: int, msg_id: int, patient: dict
+) -> None:
+    """Send the final consultation result to user."""
+    # Send handoff (short summary)
+    handoff = result.get("handoff", "")
+    if handoff:
+        if len(handoff) > 4000:
+            handoff = handoff[:4000] + "\n\n... (xem báo cáo đầy đủ qua web)"
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=msg_id, text=handoff,
+        )
+    else:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=msg_id,
+            text="Đã hoàn thành tư vấn. Dùng /report để xem báo cáo chi tiết.",
+        )
+
+    # Send report link
+    report_path = result.get("report_path", "")
+    if report_path:
+        report_id = Path(report_path).stem
+        await update.message.reply_text(
+            f"Báo cáo chi tiết:\n"
+            f"http://{WEB_HOST}:{WEB_PORT}/report/{report_id}\n\n"
+            f"Bệnh nhân: {patient['name']}\n"
+            "Lưu ý: Thông tin chỉ mang tính tham khảo."
         )
 
 
@@ -425,11 +652,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         description=caption,
     )
 
-    await update.message.reply_text(
-        f"Đã lưu ảnh vào hồ sơ {patient['name']}.\n"
-        f"{'Mô tả: ' + caption if caption else ''}\n\n"
-        "Gửi thêm thông tin hoặc mô tả triệu chứng để bắt đầu tư vấn."
-    )
+    if session.get("state") == "interviewing":
+        await update.message.reply_text(
+            f"Đã lưu ảnh vào hồ sơ {patient['name']}.\n"
+            f"{'Mô tả: ' + caption if caption else ''}\n\n"
+            "Tôi đã ghi nhận. Bạn có thể tiếp tục trả lời câu hỏi phía trên."
+        )
+    else:
+        await update.message.reply_text(
+            f"Đã lưu ảnh vào hồ sơ {patient['name']}.\n"
+            f"{'Mô tả: ' + caption if caption else ''}\n\n"
+            "Gửi thêm thông tin hoặc mô tả triệu chứng để bắt đầu tư vấn."
+        )
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -462,10 +696,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         description=update.message.caption or "",
     )
 
-    await update.message.reply_text(
-        f"Đã lưu file '{doc.file_name}' vào hồ sơ {patient['name']}.\n\n"
-        "Gửi thêm thông tin hoặc mô tả triệu chứng để bắt đầu tư vấn."
-    )
+    if session.get("state") == "interviewing":
+        await update.message.reply_text(
+            f"Đã lưu file '{doc.file_name}' vào hồ sơ {patient['name']}.\n\n"
+            "Tôi đã ghi nhận. Bạn có thể tiếp tục trả lời câu hỏi phía trên."
+        )
+    else:
+        await update.message.reply_text(
+            f"Đã lưu file '{doc.file_name}' vào hồ sơ {patient['name']}.\n\n"
+            "Gửi thêm thông tin hoặc mô tả triệu chứng để bắt đầu tư vấn."
+        )
 
 
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
