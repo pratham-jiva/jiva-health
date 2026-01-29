@@ -118,6 +118,25 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(id),
             FOREIGN KEY (consultation_id) REFERENCES consultations(id)
         );
+
+        -- User facts (5W1H: isolated memory per user)
+        -- Who: user_id, What: fact, When: learned_at, Where: source,
+        -- Why: context, How: extracted_from
+        CREATE TABLE IF NOT EXISTS user_facts (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            fact_key TEXT NOT NULL,
+            fact_value TEXT NOT NULL,
+            confidence REAL DEFAULT 1.0,
+            source TEXT,
+            learned_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_facts_user ON user_facts(user_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_user_facts_unique
+            ON user_facts(user_id, category, fact_key);
     """)
     conn.commit()
     conn.close()
@@ -465,6 +484,100 @@ def clear_knowledge() -> None:
     conn.execute("DELETE FROM knowledge")
     conn.commit()
     conn.close()
+
+
+# --- User Facts (Isolated Memory per User) ---
+
+def save_user_fact(user_id: int, category: str, fact_key: str, fact_value: str,
+                   confidence: float = 1.0, source: str = None) -> dict:
+    """Save or update a fact about a user. Uses UPSERT to avoid duplicates.
+
+    Categories: identity, health, preference, context
+    Examples:
+      - ("identity", "gender", "male", source="user_said")
+      - ("identity", "name", "Hạnh", source="telegram")
+      - ("health", "allergy", "penicillin", source="consultation_c_20260129")
+      - ("preference", "language", "vi", source="auto_detect")
+    """
+    conn = get_db()
+    now = datetime.now().isoformat()
+    conn.execute(
+        """INSERT INTO user_facts (user_id, category, fact_key, fact_value,
+           confidence, source, learned_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(user_id, category, fact_key)
+           DO UPDATE SET fact_value=excluded.fact_value,
+                         confidence=excluded.confidence,
+                         source=excluded.source,
+                         updated_at=excluded.updated_at""",
+        (user_id, category, fact_key, fact_value, confidence, source, now, now),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM user_facts WHERE user_id=? AND category=? AND fact_key=?",
+        (user_id, category, fact_key),
+    ).fetchone()
+    conn.close()
+    return dict(row)
+
+
+def get_user_facts(user_id: int, category: str = None) -> list[dict]:
+    """Get all facts about a user, optionally filtered by category."""
+    conn = get_db()
+    if category:
+        rows = conn.execute(
+            "SELECT * FROM user_facts WHERE user_id=? AND category=? ORDER BY updated_at DESC",
+            (user_id, category),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM user_facts WHERE user_id=? ORDER BY category, updated_at DESC",
+            (user_id,),
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_user_fact(user_id: int, category: str, fact_key: str) -> dict | None:
+    """Get a specific fact about a user."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM user_facts WHERE user_id=? AND category=? AND fact_key=?",
+        (user_id, category, fact_key),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_user_context_summary(user_id: int) -> str:
+    """Build a text summary of everything Jiva knows about this user.
+    Used to inject into agent prompts for personalized interaction."""
+    facts = get_user_facts(user_id)
+    if not facts:
+        return ""
+
+    lines = ["Thong tin da biet ve nguoi dung:"]
+    by_cat = {}
+    for f in facts:
+        cat = f["category"]
+        if cat not in by_cat:
+            by_cat[cat] = []
+        by_cat[cat].append(f)
+
+    cat_labels = {
+        "identity": "Than nhan",
+        "health": "Suc khoe",
+        "preference": "So thich",
+        "context": "Boi canh",
+    }
+
+    for cat, cat_facts in by_cat.items():
+        label = cat_labels.get(cat, cat)
+        lines.append(f"\n[{label}]")
+        for f in cat_facts:
+            lines.append(f"- {f['fact_key']}: {f['fact_value']}")
+
+    return "\n".join(lines)
 
 
 # --- Helpers ---

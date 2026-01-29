@@ -5,6 +5,7 @@ Backend: Claude Code CLI (khong can Anthropic API key).
 """
 
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -25,6 +26,7 @@ from telegram.ext import (
 
 from orchestrator import HealthOrchestrator
 import database as db
+from tools.ask_patient import check_pending_question, write_answer, get_ipc_path, IPC_DIR
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -47,6 +49,55 @@ SUPER_ADMINS = {
 # Active sessions: telegram_id -> {user, patient, state, orchestrator, ...}
 user_sessions: dict[int, dict] = {}
 
+# Session state persistence file (survives restarts)
+SESSION_STATE_FILE = Path(__file__).parent / "data" / "active_sessions.json"
+
+
+def _save_session_state(tg_id: int, state: str, consultation_id: str = ""):
+    """Persist active session state to file so it survives bot restarts."""
+    try:
+        data = {}
+        if SESSION_STATE_FILE.exists():
+            data = json.loads(SESSION_STATE_FILE.read_text(encoding="utf-8"))
+        data[str(tg_id)] = {"state": state, "consultation_id": consultation_id}
+        SESSION_STATE_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.error(f"Failed to save session state: {e}")
+
+
+def _load_session_state(tg_id: int) -> dict | None:
+    """Load persisted session state (after restart)."""
+    try:
+        if SESSION_STATE_FILE.exists():
+            data = json.loads(SESSION_STATE_FILE.read_text(encoding="utf-8"))
+            return data.get(str(tg_id))
+    except Exception:
+        pass
+    return None
+
+
+def _clear_session_state(tg_id: int):
+    """Clear persisted session state."""
+    try:
+        if SESSION_STATE_FILE.exists():
+            data = json.loads(SESSION_STATE_FILE.read_text(encoding="utf-8"))
+            data.pop(str(tg_id), None)
+            SESSION_STATE_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _has_pending_ipc_question(consultation_id: str) -> bool:
+    """Check if there's an active IPC question waiting for answer."""
+    ipc_path = get_ipc_path(consultation_id)
+    if ipc_path.exists():
+        try:
+            data = json.loads(ipc_path.read_text(encoding="utf-8"))
+            return data.get("status") == "waiting"
+        except Exception:
+            pass
+    return False
+
 
 def _get_session(telegram_user) -> dict:
     """Get or create session for telegram user."""
@@ -62,6 +113,11 @@ def _get_session(telegram_user) -> dict:
             "patient": None,
             "state": "idle",
         }
+        # Save identity facts from Telegram profile
+        if full_name:
+            db.save_user_fact(user["id"], "identity", "full_name", full_name, source="telegram")
+        if username:
+            db.save_user_fact(user["id"], "identity", "telegram_username", username, source="telegram")
     return user_sessions[tg_id]
 
 
@@ -247,8 +303,56 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
 
 
+async def _poll_and_forward_questions(
+    session_id: str, chat_id: int, bot, loop
+) -> None:
+    """Poll IPC file for questions from MCP ask_patient tool.
+
+    While orchestrator runs in a thread, this coroutine polls for questions
+    from the consultant agent and forwards them to the Telegram user.
+    When user replies, handle_message (state=waiting_ipc_reply) writes the
+    answer back to the IPC file, which the MCP tool picks up.
+    """
+    from tools.ask_patient import get_ipc_path
+
+    poll_interval = 0.5  # seconds
+    last_question = None
+
+    while True:
+        try:
+            await asyncio.sleep(poll_interval)
+
+            # Check if there's a pending question from the agent
+            question = check_pending_question(session_id)
+
+            if question and question != last_question:
+                last_question = question
+                # Forward question to user via Telegram
+                logger.info(f"IPC bridge: forwarding question for {session_id}")
+                await bot.send_message(chat_id=chat_id, text=question)
+
+            # Check if IPC file still exists (if not, either answered or timed out)
+            ipc_path = get_ipc_path(session_id)
+            if not ipc_path.exists() and last_question:
+                # Question was answered or timed out, reset for next question
+                last_question = None
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"IPC poll error: {e}")
+            await asyncio.sleep(1)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle patient messages - interactive consultation with interview."""
+    """Handle patient messages - interactive consultation with interview.
+
+    The consultant agent handles interview autonomously via MCP ask_patient tool.
+    This handler:
+    1. Starts orchestrator in a background thread
+    2. Polls IPC files to forward agent questions to user via Telegram
+    3. Routes user replies back to the agent via IPC
+    """
     session = _get_session(update.effective_user)
     user = session["user"]
     message = update.message.text
@@ -270,10 +374,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # Handle interview reply - user is answering a follow-up question
-    if session.get("state") == "interviewing":
-        await _handle_interview_reply(update, context, session, message)
+    # Handle IPC reply - user is answering a question from MCP ask_patient tool
+    if session.get("state") == "waiting_ipc_reply":
+        session_id = session.get("consultation_id", "")
+        if session_id:
+            write_answer(session_id, message)
+            logger.info(f"IPC answer written for {session_id}: {message[:50]}")
+            # Save to DB
+            db.save_message(user_id=user["id"], role="user", content=message,
+                            consultation_id=session.get("db_consultation_id"))
+            # Stay in waiting_ipc_reply state - orchestrator thread will continue
+            # and may ask more questions (polling task handles it)
         return
+
+    # Recovery: check if there's a pending IPC question (after restart)
+    if session.get("state") == "idle":
+        persisted = _load_session_state(update.effective_user.id)
+        if persisted and persisted.get("state") == "waiting_ipc_reply":
+            cid = persisted.get("consultation_id", "")
+            if cid and _has_pending_ipc_question(cid):
+                # Recover: write answer to IPC
+                write_answer(cid, message)
+                logger.info(f"IPC answer (recovered) for {cid}: {message[:50]}")
+                session["state"] = "waiting_ipc_reply"
+                session["consultation_id"] = cid
+                db.save_message(user_id=user["id"], role="user", content=message)
+                return
 
     # Handle clarification reply - agent asked for more info during analysis
     if session.get("state") == "clarifying":
@@ -306,9 +432,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     msg_id = processing_msg.message_id
     loop = asyncio.get_event_loop()
 
+    total_steps = 8  # emergency, interview, research, eval, causes, solutions, synthesis, handoff
+    step_counter = {"n": 0}
+
     def _on_step_start(step_name: str, step_desc: str):
+        step_counter["n"] += 1
+        n = step_counter["n"]
         icon = STEP_ICONS.get(step_name, "⏳")
-        text = f"🔍 {icon} {step_desc}..."
+        progress_bar = ">" * n + "." * (total_steps - n)
+        text = (
+            f"Đang tư vấn cho {patient['name']}...\n"
+            f"[{progress_bar}] {n}/{total_steps}\n"
+            f"{icon} {step_desc}..."
+        )
         try:
             asyncio.run_coroutine_threadsafe(
                 context.bot.edit_message_text(
@@ -320,37 +456,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             pass
 
     try:
-        # Create orchestrator and start intake (Phase 1)
+        # Pre-generate consultation_id so IPC polling matches the session
+        from datetime import datetime as _dt
+        consultation_id = f"c_{_dt.now().strftime('%Y%m%d_%H%M%S')}"
+
+        # Create orchestrator with pre-set consultation_id
         orchestrator = HealthOrchestrator(
             user_id=user["id"],
             patient_id=patient["id"],
             on_step_start=_on_step_start,
+            consultation_id=consultation_id,
         )
 
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, orchestrator.start_intake, message
+        # Set session state so user replies go to IPC
+        session["state"] = "waiting_ipc_reply"
+        session["orchestrator"] = orchestrator
+        session["consultation_id"] = consultation_id
+        _save_session_state(update.effective_user.id, "waiting_ipc_reply", consultation_id)
+
+        # Start polling task
+        poll_task = asyncio.create_task(
+            _poll_and_forward_questions(consultation_id, chat_id, context.bot, loop)
         )
+
+        # Run orchestrator in thread (blocks while consultant interviews + analysis)
+        # Pass pre-generated consultation_id so IPC session matches
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: orchestrator.start_intake(message, consultation_id=consultation_id)
+        )
+
+        # Cancel polling task when orchestrator finishes
+        poll_task.cancel()
+        try:
+            await poll_task
+        except asyncio.CancelledError:
+            pass
+
+        # Reset session state
+        session["state"] = "idle"
+        session.pop("orchestrator", None)
+        _clear_session_state(update.effective_user.id)
 
         if result.get("emergency"):
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=msg_id, text=result["message"],
             )
-            return
-
-        if result.get("needs_interview"):
-            # Bot needs to ask follow-up questions
-            # Delete the processing message and send the question naturally
-            try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-            except Exception:
-                pass
-
-            await update.message.reply_text(result["question"])
-
-            # Store orchestrator in session for continuing later
-            session["state"] = "interviewing"
-            session["orchestrator"] = orchestrator
-            session["consultation_id"] = result["consultation_id"]
             return
 
         if result.get("needs_clarification"):
@@ -369,16 +519,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
             session["state"] = "clarifying"
             session["orchestrator"] = orchestrator
-            session["consultation_id"] = result["consultation_id"]
+            session["consultation_id"] = result.get("consultation_id", consultation_id)
             return
 
-        # No interview needed - already got full result
+        # Full result ready
         await _send_consultation_result(update, context, result, chat_id, msg_id, patient)
 
     except Exception as e:
         logger.error(f"Consultation error for user {user['id']}: {e}")
         session["state"] = "idle"
         session.pop("orchestrator", None)
+        _clear_session_state(update.effective_user.id)
         await context.bot.edit_message_text(
             chat_id=chat_id, message_id=msg_id,
             text=(
@@ -402,103 +553,8 @@ STEP_ICONS = {
 }
 
 
-async def _handle_interview_reply(
-    update: Update, context: ContextTypes.DEFAULT_TYPE,
-    session: dict, message: str
-) -> None:
-    """Handle user's reply during interactive interview."""
-    user = session["user"]
-    patient = session["patient"]
-    orchestrator = session.get("orchestrator")
-
-    if not orchestrator:
-        # Lost orchestrator (e.g., bot restarted) - restart consultation
-        session["state"] = "idle"
-        await update.message.reply_text(
-            "Phiên tư vấn bị gián đoạn. Vui lòng gửi lại mô tả triệu chứng."
-        )
-        return
-
-    # Show "thinking" indicator
-    processing_msg = await update.message.reply_text("💬 Đang xem xét thông tin...")
-
-    chat_id = update.effective_chat.id
-    msg_id = processing_msg.message_id
-    loop = asyncio.get_event_loop()
-    total_steps = 7
-    step_counter = {"current": 0}
-
-    def _on_step_start(step_name: str, step_desc: str):
-        step_counter["current"] += 1
-        n = step_counter["current"]
-        icon = STEP_ICONS.get(step_name, "⏳")
-        progress_bar = "▓" * n + "░" * (total_steps - n)
-        text = (
-            f"Đang phân tích cho {patient['name']}...\n"
-            f"[{progress_bar}] {n}/{total_steps}\n"
-            f"{icon} {step_desc}..."
-        )
-        try:
-            asyncio.run_coroutine_threadsafe(
-                context.bot.edit_message_text(
-                    chat_id=chat_id, message_id=msg_id, text=text
-                ),
-                loop,
-            ).result(timeout=5)
-        except Exception:
-            pass
-
-    # Update orchestrator's progress callback for analysis phase
-    orchestrator.on_step_start = _on_step_start
-
-    try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, orchestrator.continue_interview, message
-        )
-
-        if result.get("needs_interview"):
-            # Still interviewing - send next question
-            try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-            except Exception:
-                pass
-            await update.message.reply_text(result["question"])
-            return
-
-        if result.get("needs_clarification"):
-            # Agent needs more info during analysis
-            try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-            except Exception:
-                pass
-
-            question = result["clarification_question"]
-            step = result.get("clarification_step", "")
-            step_desc = HealthOrchestrator.STEP_NAMES.get(step, step)
-            await update.message.reply_text(
-                f"[{step_desc}]\n{question}"
-            )
-
-            session["state"] = "clarifying"
-            # Keep orchestrator in session
-            return
-
-        # Interview done - analysis running/complete
-        session["state"] = "idle"
-        session.pop("orchestrator", None)
-        await _send_consultation_result(update, context, result, chat_id, msg_id, patient)
-
-    except Exception as e:
-        logger.error(f"Interview continuation error: {e}")
-        session["state"] = "idle"
-        session.pop("orchestrator", None)
-        await context.bot.edit_message_text(
-            chat_id=chat_id, message_id=msg_id,
-            text=(
-                "Xin lỗi, đã có lỗi xảy ra. Vui lòng thử lại.\n\n"
-                "Nếu khẩn cấp: Gọi 115 (VN) / 911 (US)."
-            ),
-        )
+## _handle_interview_reply removed - consultant now handles interview
+## autonomously via MCP ask_patient tool. See handle_message + IPC polling.
 
 
 async def _handle_clarification_reply(
@@ -652,7 +708,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         description=caption,
     )
 
-    if session.get("state") == "interviewing":
+    if session.get("state") == "waiting_ipc_reply":
         await update.message.reply_text(
             f"Đã lưu ảnh vào hồ sơ {patient['name']}.\n"
             f"{'Mô tả: ' + caption if caption else ''}\n\n"
@@ -696,7 +752,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         description=update.message.caption or "",
     )
 
-    if session.get("state") == "interviewing":
+    if session.get("state") == "waiting_ipc_reply":
         await update.message.reply_text(
             f"Đã lưu file '{doc.file_name}' vào hồ sơ {patient['name']}.\n\n"
             "Tôi đã ghi nhận. Bạn có thể tiếp tục trả lời câu hỏi phía trên."

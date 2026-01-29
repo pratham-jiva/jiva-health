@@ -251,6 +251,9 @@ class HealthOrchestrator:
                 "extracted": response,
             }
 
+        # Extract and save user facts from interview
+        self._extract_and_save_facts(response, patient_message)
+
         self._notify("interview", "done")
 
         # Proceed to analysis phase
@@ -299,6 +302,47 @@ class HealthOrchestrator:
             self._notify("interview", "done")
             return self._run_analysis_phase()
 
+    def _extract_and_save_facts(self, profile_response: str, patient_message: str):
+        """Extract facts from consultant interview and save to user_facts table.
+
+        Extracts basic identity/health info from the YAML profile output
+        without calling an extra LLM. Simple keyword extraction.
+        """
+        if not self.user_id:
+            return
+
+        consultation_id = self.consultation.get("id", "unknown")
+        source = f"consultation_{consultation_id}"
+        text = (profile_response + "\n" + patient_message).lower()
+
+        # Gender detection
+        gender_male = any(w in text for w in ["mr.", "nam", "anh", "minh la mr", "gioi tinh: nam", "gender: male"])
+        gender_female = any(w in text for w in ["mrs.", "ms.", "nu", "chi", "co", "gioi tinh: nu", "gender: female"])
+        if gender_male and not gender_female:
+            db.save_user_fact(self.user_id, "identity", "gender", "nam", source=source)
+        elif gender_female and not gender_male:
+            db.save_user_fact(self.user_id, "identity", "gender", "nu", source=source)
+
+        # Age extraction (simple pattern)
+        import re
+        age_match = re.search(r'(?:tuoi|age)[:\s]*(\d{1,3})', text)
+        if age_match:
+            db.save_user_fact(self.user_id, "identity", "age", age_match.group(1), source=source)
+
+        # Location
+        location_match = re.search(r'(?:o|tai|song tai|dia chi|location)[:\s]*([^\n,]{3,30})', text)
+        if location_match:
+            loc = location_match.group(1).strip()
+            if len(loc) > 2:
+                db.save_user_fact(self.user_id, "identity", "location", loc, source=source)
+
+        # Chief complaint as health fact
+        complaint = patient_message[:200]
+        db.save_user_fact(
+            self.user_id, "health", "last_complaint",
+            complaint, source=source,
+        )
+
     def _run_consultant_interview(self, patient_message: str) -> str:
         """Run consultant interview using MCP ask_patient tool.
 
@@ -310,6 +354,11 @@ class HealthOrchestrator:
         Returns: Full consultant response with [INTAKE_COMPLETE] and profile.
         """
         session_id = self.consultation["id"]
+
+        # User memory context (what Jiva knows about this user from past interactions)
+        user_memory = ""
+        if self.user_id:
+            user_memory = db.get_user_context_summary(self.user_id)
 
         # Patient context from DB
         patient_context = ""
@@ -345,7 +394,7 @@ class HealthOrchestrator:
                 "- Cuoi cung PHAI output [INTAKE_COMPLETE] + profile."
             ),
             user_prompt=(
-                f"{patient_context}\n"
+                f"{user_memory}\n{patient_context}\n"
                 f"Benh nhan gui tin nhan:\n{patient_message}\n\n"
                 "Bat dau interview. Neu can hoi them, dung tool ask_patient(question='...'). "
                 "Khi du thong tin, output [INTAKE_COMPLETE] + YAML profile."
