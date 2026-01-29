@@ -551,12 +551,25 @@ def get_user_fact(user_id: int, category: str, fact_key: str) -> dict | None:
 
 def get_user_context_summary(user_id: int) -> str:
     """Build a text summary of everything Jiva knows about this user.
-    Used to inject into agent prompts for personalized interaction."""
+    Used to inject into agent prompts for personalized interaction.
+
+    Includes greeting hint based on gender for correct pronoun usage.
+    """
     facts = get_user_facts(user_id)
     if not facts:
         return ""
 
-    lines = ["Thong tin da biet ve nguoi dung:"]
+    lines = ["## THONG TIN DA BIET VE NGUOI DUNG (user memory)"]
+
+    # Check gender for pronoun hint
+    gender_fact = get_user_fact(user_id, "identity", "gender")
+    if gender_fact:
+        gender = gender_fact["fact_value"].lower()
+        if gender in ("nam", "male"):
+            lines.append("XUNG HO: Goi 'anh' (nam gioi)")
+        elif gender in ("nu", "female"):
+            lines.append("XUNG HO: Goi 'chi' (nu gioi)")
+
     by_cat = {}
     for f in facts:
         cat = f["category"]
