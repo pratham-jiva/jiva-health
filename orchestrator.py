@@ -69,9 +69,24 @@ def _call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 4000) -
 class HealthOrchestrator:
     """Orchestrates the 8-step health consultation workflow."""
 
-    def __init__(self, user_id: int = None, patient_id: int = None):
+    # Step descriptions for progress notifications
+    STEP_NAMES = {
+        "emergency_check": "Kiểm tra khẩn cấp",
+        "intake": "Thu thập thông tin bệnh nhân",
+        "research": "Tra cứu tài liệu y khoa",
+        "eval": "Đánh giá tình trạng",
+        "causes": "Phân tích nguyên nhân",
+        "solutions": "Tìm phương án điều trị",
+        "synthesis": "Tổng hợp báo cáo",
+        "handoff": "Chuẩn bị kết quả tư vấn",
+    }
+
+    def __init__(self, user_id: int = None, patient_id: int = None,
+                 on_step_start=None, on_step_done=None):
         self.user_id = user_id
         self.patient_id = patient_id
+        self.on_step_start = on_step_start  # callback(step_name, step_desc)
+        self.on_step_done = on_step_done    # callback(step_name, step_desc)
         self.consultation = {
             "id": None,
             "started_at": None,
@@ -84,6 +99,17 @@ class HealthOrchestrator:
             "report": None,
             "handoff": None,
         }
+
+    def _notify(self, step: str, event: str = "start"):
+        """Notify progress via callback."""
+        desc = self.STEP_NAMES.get(step, step)
+        try:
+            if event == "start" and self.on_step_start:
+                self.on_step_start(step, desc)
+            elif event == "done" and self.on_step_done:
+                self.on_step_done(step, desc)
+        except Exception:
+            pass  # Don't let notification errors break the workflow
 
     def start_consultation(self, patient_message: str) -> dict:
         """Run full 8-step consultation from patient message."""
@@ -111,6 +137,7 @@ class HealthOrchestrator:
         steps = {}
 
         # Step 0: Emergency Check
+        self._notify("emergency_check", "start")
         emergency = self._check_emergency(patient_message)
         if emergency["is_emergency"]:
             if db_consultation:
@@ -127,36 +154,46 @@ class HealthOrchestrator:
                 "steps_completed": ["emergency_check"],
             }
         steps["emergency_check"] = "passed"
+        self._notify("emergency_check", "done")
 
         # Step 1: Quick Intake (from message directly, no interview)
+        self._notify("intake", "start")
         profile = self._quick_intake(patient_message)
         self.consultation["patient_profile"] = profile
         steps["intake"] = "done"
         if db_consultation:
             db.update_consultation(consultation_id, patient_profile=profile.get("extracted", ""))
+        self._notify("intake", "done")
 
         # Step 2: Research
+        self._notify("research", "start")
         research_result = self._run_research(profile)
         self.consultation["research_findings"] = research_result
         steps["research"] = "done"
         if db_consultation:
             db.update_consultation(consultation_id, research_findings=research_result)
+        self._notify("research", "done")
 
         # Step 3: Status Assessment
+        self._notify("eval", "start")
         eval_result = self._run_eval(profile, research_result)
         self.consultation["status_assessment"] = eval_result
         steps["eval"] = "done"
         if db_consultation:
             db.update_consultation(consultation_id, status_assessment=eval_result)
+        self._notify("eval", "done")
 
         # Step 4: Cause Analysis
+        self._notify("causes", "start")
         causes_result = self._run_causes(profile, research_result)
         self.consultation["causal_analysis"] = causes_result
         steps["causes"] = "done"
         if db_consultation:
             db.update_consultation(consultation_id, causal_analysis=causes_result)
+        self._notify("causes", "done")
 
         # Step 5: Solutions
+        self._notify("solutions", "start")
         solutions_result = self._run_solutions(
             profile, research_result, eval_result, causes_result
         )
@@ -164,16 +201,21 @@ class HealthOrchestrator:
         steps["solutions"] = "done"
         if db_consultation:
             db.update_consultation(consultation_id, solutions=solutions_result)
+        self._notify("solutions", "done")
 
         # Step 6: Synthesis - Generate Report
+        self._notify("synthesis", "start")
         report = self._synthesize_report()
         self.consultation["report"] = report
         steps["synthesis"] = "done"
+        self._notify("synthesis", "done")
 
         # Step 7: Handoff - Summary & Teach-back
+        self._notify("handoff", "start")
         handoff = self._generate_handoff()
         self.consultation["handoff"] = handoff
         steps["handoff"] = "done"
+        self._notify("handoff", "done")
 
         # Save report to file
         report_path = self._save_report(consultation_id, report)
@@ -270,6 +312,13 @@ class HealthOrchestrator:
         messages = research.build_research_prompt(profile)
         system_msg = messages[0]["content"]
         user_msg = messages[1]["content"]
+
+        # Include knowledge base entries as additional context
+        kb_entries = db.get_knowledge(limit=20)
+        if kb_entries:
+            kb_text = "\n".join(f"- {e['content']}" for e in kb_entries)
+            user_msg += f"\n\nKnowledge Base (thong tin bo sung tu chuyen gia):\n{kb_text}"
+
         return _call_claude(system_prompt=system_msg, user_prompt=user_msg)
 
     def _run_eval(self, profile: dict, research_result: str) -> str:

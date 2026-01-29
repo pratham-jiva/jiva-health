@@ -39,6 +39,11 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 WEB_HOST = os.getenv("WEB_HOST", "45.32.110.105")
 WEB_PORT = os.getenv("WEB_PORT", "8080")
 
+# Super admins (username -> role)
+SUPER_ADMINS = {
+    "passanta": "super_admin",  # Trương Hồng Hạnh
+}
+
 # Active sessions: telegram_id -> {user, patient, state}
 user_sessions: dict[int, dict] = {}
 
@@ -284,13 +289,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Notify processing
     processing_msg = await update.message.reply_text(
         f"Đang tư vấn cho {patient['name']}...\n"
-        "(Gồm nhiều bước phân tích, vui lòng chờ)"
+        "Bước 1/7: Kiểm tra khẩn cấp..."
     )
 
+    # Progress callback - updates the processing message with current step
+    chat_id = update.effective_chat.id
+    msg_id = processing_msg.message_id
+    loop = asyncio.get_event_loop()
+    total_steps = 7
+    step_counter = {"current": 0}
+
+    STEP_ICONS = {
+        "emergency_check": "🔍",
+        "intake": "📋",
+        "research": "📚",
+        "eval": "🔬",
+        "causes": "🔎",
+        "solutions": "💊",
+        "synthesis": "📝",
+        "handoff": "✅",
+    }
+
+    def _on_step_start(step_name: str, step_desc: str):
+        step_counter["current"] += 1
+        n = step_counter["current"]
+        icon = STEP_ICONS.get(step_name, "⏳")
+        progress_bar = "▓" * n + "░" * (total_steps - n)
+        text = (
+            f"Đang tư vấn cho {patient['name']}...\n"
+            f"[{progress_bar}] {n}/{total_steps}\n"
+            f"{icon} {step_desc}..."
+        )
+        try:
+            asyncio.run_coroutine_threadsafe(
+                context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg_id, text=text
+                ),
+                loop,
+            ).result(timeout=5)
+        except Exception:
+            pass
+
     try:
-        # Run consultation in thread pool (Claude CLI calls are blocking)
+        # Run consultation in thread pool with progress callbacks
         orchestrator = HealthOrchestrator(
-            user_id=user["id"], patient_id=patient["id"]
+            user_id=user["id"],
+            patient_id=patient["id"],
+            on_step_start=_on_step_start,
         )
         result = await asyncio.get_event_loop().run_in_executor(
             None, orchestrator.start_consultation, message
@@ -298,8 +343,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         if result.get("emergency"):
             await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id,
-                message_id=processing_msg.message_id,
+                chat_id=chat_id,
+                message_id=msg_id,
                 text=result["message"],
             )
             return
@@ -308,17 +353,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         handoff = result.get("handoff", "")
         if handoff:
             if len(handoff) > 4000:
-                handoff = handoff[:4000] + "\n\n... (xem bao cao day du qua web)"
+                handoff = handoff[:4000] + "\n\n... (xem báo cáo đầy đủ qua web)"
 
             await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id,
-                message_id=processing_msg.message_id,
+                chat_id=chat_id,
+                message_id=msg_id,
                 text=handoff,
             )
         else:
             await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id,
-                message_id=processing_msg.message_id,
+                chat_id=chat_id,
+                message_id=msg_id,
                 text="Đã hoàn thành tư vấn. Dùng /report để xem báo cáo chi tiết.",
             )
 
@@ -336,8 +381,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e:
         logger.error(f"Consultation error for user {user['id']}: {e}")
         await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id,
-            message_id=processing_msg.message_id,
+            chat_id=chat_id,
+            message_id=msg_id,
             text=(
                 "Xin lỗi, đã có lỗi xảy ra trong quá trình tư vấn. "
                 "Vui lòng thử lại sau.\n\n"
@@ -447,6 +492,55 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
 
 
+def _is_super_admin(telegram_user) -> bool:
+    """Check if user is a super admin."""
+    username = (telegram_user.username or "").lower()
+    return username in SUPER_ADMINS
+
+
+async def kb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /kb - knowledge base management (super admin only)."""
+    if not _is_super_admin(update.effective_user):
+        await update.message.reply_text(
+            "Bạn không có quyền sử dụng lệnh này."
+        )
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Quản lý Knowledge Base (Super Admin)\n\n"
+            "Lệnh:\n"
+            "/kb add <nội dung> - Thêm kiến thức mới\n"
+            "/kb list - Xem danh sách kiến thức\n"
+            "/kb clear - Xóa tất cả (cẩn thận!)\n\n"
+            "Ví dụ:\n"
+            '/kb add Vitamin D liều 5000 IU/ngày an toàn cho người trưởng thành'
+        )
+        return
+
+    action = args[0].lower()
+    content = " ".join(args[1:]) if len(args) > 1 else ""
+
+    if action == "add" and content:
+        db.add_knowledge(content, added_by=update.effective_user.username)
+        await update.message.reply_text(f"Đã thêm vào knowledge base:\n{content}")
+    elif action == "list":
+        entries = db.get_knowledge()
+        if entries:
+            text = "Knowledge Base:\n\n"
+            for i, e in enumerate(entries, 1):
+                text += f"{i}. {e['content'][:100]}\n   (bởi @{e.get('added_by', '?')} - {e['created_at'][:10]})\n\n"
+            await update.message.reply_text(text[:4000])
+        else:
+            await update.message.reply_text("Knowledge base trống.")
+    elif action == "clear":
+        db.clear_knowledge()
+        await update.message.reply_text("Đã xóa toàn bộ knowledge base.")
+    else:
+        await update.message.reply_text("Lệnh không hợp lệ. Dùng /kb để xem hướng dẫn.")
+
+
 def _split_text(text: str, max_len: int = 4000) -> list[str]:
     """Split text into chunks for Telegram."""
     if len(text) <= max_len:
@@ -497,6 +591,7 @@ def main():
     app.add_handler(CommandHandler("newpatient", newpatient_cmd))
     app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
+    app.add_handler(CommandHandler("kb", kb_cmd))
 
     # Callbacks (inline buttons)
     app.add_handler(CallbackQueryHandler(handle_callback))

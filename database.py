@@ -99,6 +99,14 @@ def init_db():
             FOREIGN KEY (patient_id) REFERENCES patients(id)
         );
 
+        -- Knowledge base (super admin can update)
+        CREATE TABLE IF NOT EXISTS knowledge (
+            id INTEGER PRIMARY KEY,
+            content TEXT NOT NULL,
+            added_by TEXT,
+            created_at TEXT NOT NULL
+        );
+
         -- Conversation messages (luu lich su hoi thoai)
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY,
@@ -422,6 +430,41 @@ def get_recent_messages(user_id: int, limit: int = 20) -> list[dict]:
     ).fetchall()
     conn.close()
     return [dict(r) for r in reversed(rows)]
+
+
+# --- Knowledge base operations ---
+
+def add_knowledge(content: str, added_by: str = None) -> dict:
+    """Add a knowledge entry."""
+    conn = get_db()
+    now = datetime.now().isoformat()
+    conn.execute(
+        "INSERT INTO knowledge (content, added_by, created_at) VALUES (?, ?, ?)",
+        (content, added_by, now),
+    )
+    conn.commit()
+    kid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    row = conn.execute("SELECT * FROM knowledge WHERE id = ?", (kid,)).fetchone()
+    conn.close()
+    return dict(row)
+
+
+def get_knowledge(limit: int = 50) -> list[dict]:
+    """Get all knowledge entries."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM knowledge ORDER BY created_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def clear_knowledge() -> None:
+    """Clear all knowledge entries."""
+    conn = get_db()
+    conn.execute("DELETE FROM knowledge")
+    conn.commit()
+    conn.close()
 
 
 # --- Helpers ---
