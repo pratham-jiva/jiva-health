@@ -2,14 +2,19 @@
 
 AI Health Assistant - Intelligent medical consultation powered by Jiva.
 
+**Backend**: Claude Code CLI (no API key needed).
+
 **Disclaimer**: This is for informational purposes only, NOT medical diagnosis.
 
 ## Architecture
 
 ```
-User (Telegram) --> Telegram Bot --> Orchestrator --> 5 AI Agents --> Report
-                                                                  --> Web View
+User (Telegram) --> Telegram Bot --> Orchestrator --> Claude Code CLI --> Report
+                                                                     --> Web View
 ```
+
+Orchestrator calls `claude -p "prompt"` via subprocess for each agent step.
+No Anthropic API key required - uses the Claude Code subscription directly.
 
 ### Agents
 | Agent | Role |
@@ -21,7 +26,7 @@ User (Telegram) --> Telegram Bot --> Orchestrator --> 5 AI Agents --> Report
 | Solutions | Treatment options & recommendations |
 
 ### 8-Step Workflow
-0. Emergency Check
+0. Emergency Check (keyword scan - no AI needed)
 1. Intake (extract patient profile)
 2. Research (medical literature)
 3. Status Assessment
@@ -36,7 +41,8 @@ User (Telegram) --> Telegram Bot --> Orchestrator --> 5 AI Agents --> Report
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env with your API keys
+# Edit .env with Telegram bot token
+# Ensure 'claude' CLI is installed and in PATH
 ```
 
 ## Run

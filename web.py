@@ -1,9 +1,8 @@
 """
 Jiva Health - Web Server
-Serve HTML page để xem health consultation reports.
+Serve HTML page de xem health consultation reports.
 """
 
-import json
 from datetime import datetime
 from pathlib import Path
 

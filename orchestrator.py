@@ -1,46 +1,77 @@
 """
 Jiva Health Orchestrator
-Điều phối 8-step consultation workflow.
-Jiva tự điều phối, không dùng Team-Z SDK.
+Dieu phoi 8-step consultation workflow.
+Dung Claude Code CLI (subprocess) thay vi Anthropic API.
 """
 
 import json
 import os
-import re
-import time
+import subprocess
+import shutil
 from datetime import datetime
 from pathlib import Path
-
-import anthropic
 
 from agents import consultant, research, evaluator, causes, solutions
 
 # --- Config ---
-MODEL = "claude-sonnet-4-20250514"
+CLAUDE_BIN = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+MODEL = "sonnet"  # Claude Code model alias
 REPORTS_DIR = Path(__file__).parent / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
 
 EMERGENCY_KEYWORDS = [
-    "đau ngực", "khó thở", "mất ý thức", "chảy máu nặng",
-    "sốt cao", "co giật", "chest pain", "difficulty breathing",
+    "dau nguc", "kho tho", "mat y thuc", "chay mau nang",
+    "sot cao", "co giat", "chest pain", "difficulty breathing",
     "unconscious", "heavy bleeding", "high fever", "seizure",
-    "đột quỵ", "stroke", "heart attack", "nhồi máu"
+    "dot quy", "stroke", "heart attack", "nhoi mau",
+    "đau ngực", "khó thở", "mất ý thức", "chảy máu nặng",
+    "sốt cao", "co giật", "đột quỵ", "nhồi máu"
 ]
 
-DISCLAIMER_VN = """⚠️ THÔNG BÁO: Đây chỉ là thông tin tham khảo, KHÔNG phải chẩn đoán y khoa.
-Vui lòng tham khảo ý kiến bác sĩ cho mọi quyết định điều trị.
-KHẨN CẤP: Gọi 115 (VN) / 911 (US)"""
+DISCLAIMER_VN = """THONG BAO: Day chi la thong tin tham khao, KHONG phai chan doan y khoa.
+Vui long tham khao y kien bac si cho moi quyet dinh dieu tri.
+KHAN CAP: Goi 115 (VN) / 911 (US)"""
 
-DISCLAIMER_EN = """⚠️ DISCLAIMER: This is for informational purposes only, NOT medical diagnosis.
+DISCLAIMER_EN = """DISCLAIMER: This is for informational purposes only, NOT medical diagnosis.
 Please consult your doctor for all treatment decisions.
 EMERGENCY: Call 115 (VN) / 911 (US)"""
+
+
+def _call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 4000) -> str:
+    """Call Claude Code CLI in print mode.
+
+    Uses: claude -p "prompt" --model sonnet --no-session-persistence
+    System prompt is prepended to user prompt since CLI has no --system flag.
+    """
+    full_prompt = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{user_prompt}"
+
+    cmd = [
+        CLAUDE_BIN,
+        "-p", full_prompt,
+        "--model", MODEL,
+        "--no-session-persistence",
+        "--output-format", "text",
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=str(Path(__file__).parent),
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Claude CLI error: {result.stderr[:500]}")
+        return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Claude CLI timed out (120s)")
 
 
 class HealthOrchestrator:
     """Orchestrates the 8-step health consultation workflow."""
 
     def __init__(self):
-        self.client = anthropic.Anthropic()
         self.consultation = {
             "id": None,
             "started_at": None,
@@ -78,7 +109,7 @@ class HealthOrchestrator:
         self.consultation["patient_profile"] = profile
         steps["intake"] = "done"
 
-        # Step 2: Research FIRST
+        # Step 2: Research
         research_result = self._run_research(profile)
         self.consultation["research_findings"] = research_result
         steps["research"] = "done"
@@ -92,8 +123,6 @@ class HealthOrchestrator:
         causes_result = self._run_causes(profile, research_result)
         self.consultation["causal_analysis"] = causes_result
         steps["causes"] = "done"
-
-        # Step 4.5: Treatment Eval (included in eval step)
 
         # Step 5: Solutions
         solutions_result = self._run_solutions(
@@ -134,79 +163,51 @@ class HealthOrchestrator:
                 "is_emergency": True,
                 "keywords": found,
                 "message": (
-                    "⚠️ CẢNH BÁO KHẨN CẤP\n\n"
-                    f"Phát hiện triệu chứng khẩn cấp: {', '.join(found)}\n\n"
-                    "GỌI NGAY:\n"
-                    "🇻🇳 115 (Cấp cứu VN)\n"
-                    "🇺🇸 911 (Emergency US)\n\n"
-                    "Đây có thể là tình huống cần cấp cứu. "
-                    "Vui lòng đến cơ sở y tế gần nhất NGAY."
+                    "CANH BAO KHAN CAP\n\n"
+                    f"Phat hien trieu chung khan cap: {', '.join(found)}\n\n"
+                    "GOI NGAY:\n"
+                    "VN: 115 (Cap cuu)\n"
+                    "US: 911 (Emergency)\n\n"
+                    "Day co the la tinh huong can cap cuu. "
+                    "Vui long den co so y te gan nhat NGAY."
                 ),
             }
         return {"is_emergency": False}
 
     def _quick_intake(self, message: str) -> dict:
         """Step 1: Extract patient profile from message."""
-        response = self.client.messages.create(
-            model=MODEL,
-            max_tokens=2000,
-            system=consultant.SYSTEM_PROMPT,
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        f"Bệnh nhân gửi tin nhắn sau. "
-                        f"Trích xuất Patient Profile từ thông tin có sẵn. "
-                        f"Những gì chưa biết thì ghi 'chưa rõ'.\n\n"
-                        f"Tin nhắn: {message}\n\n"
-                        f"Output YAML patient_profile."
-                    ),
-                }
-            ],
+        response = _call_claude(
+            system_prompt=consultant.SYSTEM_PROMPT,
+            user_prompt=(
+                f"Benh nhan gui tin nhan sau. "
+                f"Trich xuat Patient Profile tu thong tin co san. "
+                f"Nhung gi chua biet thi ghi 'chua ro'.\n\n"
+                f"Tin nhan: {message}\n\n"
+                f"Output YAML patient_profile."
+            ),
         )
-        return {"raw_message": message, "extracted": response.content[0].text}
+        return {"raw_message": message, "extracted": response}
 
     def _run_research(self, profile: dict) -> str:
         """Step 2: Research medical literature."""
         messages = research.build_research_prompt(profile)
         system_msg = messages[0]["content"]
-        user_msgs = messages[1:]
-
-        response = self.client.messages.create(
-            model=MODEL,
-            max_tokens=4000,
-            system=system_msg,
-            messages=user_msgs,
-        )
-        return response.content[0].text
+        user_msg = messages[1]["content"]
+        return _call_claude(system_prompt=system_msg, user_prompt=user_msg)
 
     def _run_eval(self, profile: dict, research_result: str) -> str:
         """Step 3 & 4.5: Status Assessment + Treatment ABCEF."""
         messages = evaluator.build_eval_prompt(profile, research_result)
         system_msg = messages[0]["content"]
-        user_msgs = messages[1:]
-
-        response = self.client.messages.create(
-            model=MODEL,
-            max_tokens=4000,
-            system=system_msg,
-            messages=user_msgs,
-        )
-        return response.content[0].text
+        user_msg = messages[1]["content"]
+        return _call_claude(system_prompt=system_msg, user_prompt=user_msg)
 
     def _run_causes(self, profile: dict, research_result: str) -> str:
         """Step 4: Causal chain analysis."""
         messages = causes.build_causes_prompt(profile, research_result)
         system_msg = messages[0]["content"]
-        user_msgs = messages[1:]
-
-        response = self.client.messages.create(
-            model=MODEL,
-            max_tokens=3000,
-            system=system_msg,
-            messages=user_msgs,
-        )
-        return response.content[0].text
+        user_msg = messages[1]["content"]
+        return _call_claude(system_prompt=system_msg, user_prompt=user_msg)
 
     def _run_solutions(
         self, profile: dict, research_result: str,
@@ -217,32 +218,20 @@ class HealthOrchestrator:
             profile, research_result, eval_result, causes_result
         )
         system_msg = messages[0]["content"]
-        user_msgs = messages[1:]
-
-        response = self.client.messages.create(
-            model=MODEL,
-            max_tokens=4000,
-            system=system_msg,
-            messages=user_msgs,
-        )
-        return response.content[0].text
+        user_msg = messages[1]["content"]
+        return _call_claude(system_prompt=system_msg, user_prompt=user_msg)
 
     def _synthesize_report(self) -> str:
         """Step 6: Generate bilingual consultation report."""
         c = self.consultation
 
-        response = self.client.messages.create(
-            model=MODEL,
-            max_tokens=6000,
-            system=(
-                "Bạn là Chairman - tổng hợp báo cáo tư vấn y khoa. "
-                "Tạo báo cáo song ngữ Việt-Anh, rõ ràng, có cấu trúc. "
-                "LUÔN có disclaimer đầu và cuối."
+        return _call_claude(
+            system_prompt=(
+                "Ban la Chairman - tong hop bao cao tu van y khoa. "
+                "Tao bao cao song ngu Viet-Anh, ro rang, co cau truc. "
+                "LUON co disclaimer dau va cuoi."
             ),
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"""Tổng hợp báo cáo từ kết quả các agent:
+            user_prompt=f"""Tong hop bao cao tu ket qua cac agent:
 
 ## Patient Profile
 {c['patient_profile'].get('extracted', '')}
@@ -259,57 +248,46 @@ class HealthOrchestrator:
 ## Solutions
 {c['solutions']}
 
-Tạo báo cáo theo template:
+Tao bao cao theo template:
 
 {DISCLAIMER_VN}
 
-# BÁO CÁO TƯ VẤN Y KHOA / MEDICAL CONSULTATION REPORT
+# BAO CAO TU VAN Y KHOA / MEDICAL CONSULTATION REPORT
 
-## 1. TỔNG QUAN / OVERVIEW
-## 2. PHÂN TÍCH NGUYÊN NHÂN / CAUSAL ANALYSIS
-## 3. THÔNG TIN Y KHOA / MEDICAL INFO
-## 4. PHƯƠNG ÁN THAM KHẢO / RECOMMENDATIONS
-## 5. ĐÁNH GIÁ PHÁC ĐỒ (ABCEF) / TREATMENT EVALUATION
-## 6. HƯỚNG DẪN CHĂM SÓC / CARE GUIDE
+## 1. TONG QUAN / OVERVIEW
+## 2. PHAN TICH NGUYEN NHAN / CAUSAL ANALYSIS
+## 3. THONG TIN Y KHOA / MEDICAL INFO
+## 4. PHUONG AN THAM KHAO / RECOMMENDATIONS
+## 5. DANH GIA PHAC DO (ABCEF) / TREATMENT EVALUATION
+## 6. HUONG DAN CHAM SOC / CARE GUIDE
 
 {DISCLAIMER_VN}""",
-                }
-            ],
         )
-        return response.content[0].text
 
     def _generate_handoff(self) -> str:
         """Step 7: Handoff summary & teach-back questions."""
         c = self.consultation
 
-        response = self.client.messages.create(
-            model=MODEL,
-            max_tokens=2000,
-            system=(
-                "Bạn là Consultant đang trao trả bệnh nhân. "
-                "Tóm tắt ngắn gọn, ấm áp, dễ hiểu. "
-                "BẮT BUỘC có 2-3 câu teach-back."
+        return _call_claude(
+            system_prompt=(
+                "Ban la Consultant dang trao tra benh nhan. "
+                "Tom tat ngan gon, am ap, de hieu. "
+                "BAT BUOC co 2-3 cau teach-back."
             ),
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"""Tạo handoff cho bệnh nhân dựa trên báo cáo:
+            user_prompt=f"""Tao handoff cho benh nhan dua tren bao cao:
 
 {c['report'][:3000]}
 
 Format:
-- 3-5 điểm chính cần nhớ
-- Thuốc: cách dùng + tác dụng phụ cần biết
-- Sinh hoạt: ăn uống, nghỉ ngơi, vận động
-- Tránh: kiêng gì
-- Dấu hiệu cần gặp BS NGAY
-- 2-3 câu teach-back (hỏi để kiểm tra bệnh nhân hiểu)
-- Nhắc lịch tái khám
-- Chúc khỏe""",
-                }
-            ],
+- 3-5 diem chinh can nho
+- Thuoc: cach dung + tac dung phu can biet
+- Sinh hoat: an uong, nghi ngoi, van dong
+- Tranh: kieng gi
+- Dau hieu can gap BS NGAY
+- 2-3 cau teach-back (hoi de kiem tra benh nhan hieu)
+- Nhac lich tai kham
+- Chuc khoe""",
         )
-        return response.content[0].text
 
     def _save_report(self, consultation_id: str, report: str) -> Path:
         """Save report to file."""
@@ -336,9 +314,9 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         msg = " ".join(sys.argv[1:])
     else:
-        msg = input("Mô tả triệu chứng/tình trạng: ")
+        msg = input("Mo ta trieu chung/tinh trang: ")
 
-    print("\nĐang tư vấn...\n")
+    print("\nDang tu van...\n")
     result = run_consultation(msg)
 
     if result.get("emergency"):
@@ -347,4 +325,4 @@ if __name__ == "__main__":
         print(result["report"])
         print("\n---\n")
         print(result["handoff"])
-        print(f"\nBáo cáo đã lưu: {result['report_path']}")
+        print(f"\nBao cao da luu: {result['report_path']}")

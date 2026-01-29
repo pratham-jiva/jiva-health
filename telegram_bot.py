@@ -1,6 +1,7 @@
 """
 Jiva Health - Telegram Bot Interface
 Giao tiep voi benh nhan qua Telegram.
+Backend: Claude Code CLI (khong can Anthropic API key).
 """
 
 import asyncio
@@ -27,6 +28,10 @@ logger = logging.getLogger(__name__)
 
 # Telegram bot token
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+
+# VPS host for report links
+WEB_HOST = os.getenv("WEB_HOST", "45.32.110.105")
+WEB_PORT = os.getenv("WEB_PORT", "8080")
 
 # Store active consultations per user
 user_sessions: dict[int, dict] = {}
@@ -79,7 +84,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     try:
-        # Run consultation in thread pool (blocking API calls)
+        # Run consultation in thread pool (Claude CLI calls are blocking)
         orchestrator = HealthOrchestrator()
         result = await asyncio.get_event_loop().run_in_executor(
             None, orchestrator.start_consultation, message
@@ -99,7 +104,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Send handoff (short summary) first
         handoff = result.get("handoff", "")
         if handoff:
-            # Truncate if too long for Telegram (4096 char limit)
             if len(handoff) > 4000:
                 handoff = handoff[:4000] + "\n\n... (xem bao cao day du qua web)"
 
@@ -120,7 +124,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if report_path:
             report_id = Path(report_path).stem
             await update.message.reply_text(
-                f"Bao cao chi tiet: http://45.32.110.105:8080/report/{report_id}\n\n"
+                f"Bao cao chi tiet: http://{WEB_HOST}:{WEB_PORT}/report/{report_id}\n\n"
                 "Luu y: Thong tin chi mang tinh tham khao. "
                 "Vui long tham khao bac si."
             )
@@ -160,7 +164,7 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if report_path:
         report_id = Path(report_path).stem
         await update.message.reply_text(
-            f"Xem tren web: http://45.32.110.105:8080/report/{report_id}"
+            f"Xem tren web: http://{WEB_HOST}:{WEB_PORT}/report/{report_id}"
         )
 
 
@@ -174,7 +178,6 @@ def _split_text(text: str, max_len: int = 4000) -> list[str]:
         if len(text) <= max_len:
             chunks.append(text)
             break
-        # Find a good break point
         split_at = text.rfind("\n", 0, max_len)
         if split_at == -1:
             split_at = max_len
@@ -196,7 +199,7 @@ def main():
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Jiva Health Bot started!")
+    logger.info("Jiva Health Bot started! (Backend: Claude Code CLI)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
