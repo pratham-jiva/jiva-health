@@ -7,6 +7,7 @@ Backend: Claude Code CLI (khong can Anthropic API key).
 import asyncio
 import logging
 import os
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -75,40 +76,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     session["patient"] = default_patient
 
     await update.message.reply_text(
-        f"Xin chao {user.get('full_name', 'ban')}! "
-        f"Toi la Jiva Health Assistant.\n\n"
-        f"Benh nhan hien tai: {default_patient['name']}\n\n"
-        "Cac lenh:\n"
-        "/start - Bat dau\n"
-        "/me - Ho so cua toi\n"
-        "/patient - Chon/tao benh nhan\n"
-        "/history - Lich su kham\n"
-        "/report - Bao cao gan nhat\n"
-        "/help - Huong dan\n\n"
-        "Luu y: Day chi la thong tin tham khao, KHONG phai chan doan y khoa.\n"
-        "Khan cap: Goi 115 (VN) / 911 (US)\n\n"
-        "Hay mo ta trieu chung hoac tinh trang:"
+        f"Xin chào {user.get('full_name', 'bạn')}! "
+        f"Tôi là Jiva Health Assistant.\n\n"
+        f"Bệnh nhân hiện tại: {default_patient['name']}\n\n"
+        "Các lệnh:\n"
+        "/start - Bắt đầu\n"
+        "/me - Hồ sơ của tôi\n"
+        "/patient - Chọn/tạo bệnh nhân\n"
+        "/history - Lịch sử khám\n"
+        "/report - Báo cáo gần nhất\n"
+        "/help - Hướng dẫn\n\n"
+        "Lưu ý: Đây chỉ là thông tin tham khảo, KHÔNG phải chẩn đoán y khoa.\n"
+        "Khẩn cấp: Gọi 115 (VN) / 911 (US)\n\n"
+        "Hãy mô tả triệu chứng hoặc tình trạng sức khỏe của bạn:"
     )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /help command."""
     await update.message.reply_text(
-        "Jiva Health Assistant - Huong dan\n\n"
-        "Gui tin nhan mo ta trieu chung/tinh trang, vi du:\n"
-        '- "Toi bi dau dau 3 ngay nay"\n'
-        '- "BS ke thuoc X, muon hieu them"\n'
-        '- "Ket qua xet nghiem vitamin D = 80"\n\n'
-        "Gui hinh anh/file: Ket qua xet nghiem, don thuoc, anh X-quang...\n\n"
-        "Lenh:\n"
-        "/start - Bat dau\n"
-        "/me - Ho so cua toi\n"
-        "/patient - Chon/tao benh nhan (khi hoi cho nguoi khac)\n"
-        "/newpatient <ten> - Tao benh nhan moi nhanh\n"
-        "/history - Lich su kham\n"
-        "/report - Bao cao gan nhat\n"
-        "/help - Huong dan\n\n"
-        "Luu y: Day chi la tham khao, khong thay the kham BS."
+        "Jiva Health Assistant - Hướng dẫn\n\n"
+        "Gửi tin nhắn mô tả triệu chứng/tình trạng, ví dụ:\n"
+        '- "Tôi bị đau đầu 3 ngày nay"\n'
+        '- "BS kê thuốc X, muốn hiểu thêm"\n'
+        '- "Kết quả xét nghiệm vitamin D = 80"\n\n'
+        "Gửi hình ảnh/file: Kết quả xét nghiệm, đơn thuốc, ảnh X-quang...\n\n"
+        "Lệnh:\n"
+        "/start - Bắt đầu\n"
+        "/me - Hồ sơ của tôi\n"
+        "/patient - Chọn/tạo bệnh nhân (khi hỏi cho người khác)\n"
+        "/newpatient <tên> - Tạo bệnh nhân mới nhanh\n"
+        "/history - Lịch sử khám\n"
+        "/report - Báo cáo gần nhất\n"
+        "/help - Hướng dẫn\n\n"
+        "Lưu ý: Đây chỉ là tham khảo, không thay thế khám BS."
     )
 
 
@@ -120,24 +121,24 @@ async def me_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not patient:
         await update.message.reply_text(
-            "Chua co ho so. Gui /start de tao ho so."
+            "Chưa có hồ sơ. Gửi /start để tạo hồ sơ."
         )
         return
 
     consultations = db.get_consultations_by_patient(patient["id"], limit=5)
 
     text = (
-        f"Ho so cua ban:\n"
-        f"- Ten: {patient['name']}\n"
-        f"- Tuoi: {patient.get('age') or 'Chua cap nhat'}\n"
-        f"- Gioi: {patient.get('gender') or 'Chua cap nhat'}\n"
-        f"- Tien su: {patient.get('medical_history') or 'Chua cap nhat'}\n"
-        f"- Di ung: {patient.get('allergies') or 'Chua cap nhat'}\n"
-        f"- Thuoc: {patient.get('current_medications') or 'Chua cap nhat'}\n"
-        f"\nSo lan kham: {len(consultations)}\n"
+        f"Hồ sơ của bạn:\n"
+        f"- Tên: {patient['name']}\n"
+        f"- Tuổi: {patient.get('age') or 'Chưa cập nhật'}\n"
+        f"- Giới: {patient.get('gender') or 'Chưa cập nhật'}\n"
+        f"- Tiền sử: {patient.get('medical_history') or 'Chưa cập nhật'}\n"
+        f"- Dị ứng: {patient.get('allergies') or 'Chưa cập nhật'}\n"
+        f"- Thuốc: {patient.get('current_medications') or 'Chưa cập nhật'}\n"
+        f"\nSố lần khám: {len(consultations)}\n"
     )
     if consultations:
-        text += "\nKham gan day:\n"
+        text += "\nKhám gần đây:\n"
         for c in consultations[:3]:
             complaint = (c.get("chief_complaint") or "")[:50]
             text += f"- {c['created_at'][:10]}: {complaint}\n"
@@ -153,7 +154,7 @@ async def patient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if not patients:
         await update.message.reply_text(
-            "Chua co benh nhan nao. Dung /newpatient <ten> de tao moi."
+            "Chưa có bệnh nhân nào. Dùng /newpatient <tên> để tạo mới."
         )
         return
 
@@ -161,13 +162,13 @@ async def patient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     for p in patients:
         label = p["name"]
         if p.get("alias") == "self":
-            label += " (toi)"
+            label += " (tôi)"
         buttons.append([InlineKeyboardButton(label, callback_data=f"select_patient:{p['id']}")])
 
-    buttons.append([InlineKeyboardButton("+ Tao benh nhan moi", callback_data="new_patient")])
+    buttons.append([InlineKeyboardButton("+ Tạo bệnh nhân mới", callback_data="new_patient")])
 
     await update.message.reply_text(
-        "Chon benh nhan de tu van:",
+        "Chọn bệnh nhân để tư vấn:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
@@ -180,8 +181,8 @@ async def newpatient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     name = " ".join(context.args) if context.args else ""
     if not name:
         await update.message.reply_text(
-            "Dung: /newpatient <ten benh nhan>\n"
-            "Vi du: /newpatient Nguyen Van A"
+            "Dùng: /newpatient <tên bệnh nhân>\n"
+            "Ví dụ: /newpatient Nguyễn Văn A"
         )
         return
 
@@ -189,9 +190,9 @@ async def newpatient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     session["patient"] = patient
 
     await update.message.reply_text(
-        f"Da tao ho so benh nhan: {name}\n"
-        f"Cac tin nhan tiep theo se tu van cho {name}.\n"
-        "Mo ta trieu chung:"
+        f"Đã tạo hồ sơ bệnh nhân: {name}\n"
+        f"Các tin nhắn tiếp theo sẽ tư vấn cho {name}.\n"
+        "Mô tả triệu chứng:"
     )
 
 
@@ -202,10 +203,10 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     consultations = db.get_consultations_by_user(user["id"], limit=10)
     if not consultations:
-        await update.message.reply_text("Chua co lich su kham nao.")
+        await update.message.reply_text("Chưa có lịch sử khám nào.")
         return
 
-    text = "Lich su kham:\n\n"
+    text = "Lịch sử khám:\n\n"
     for c in consultations:
         status_icon = "V" if c["status"] == "completed" else "..."
         complaint = (c.get("chief_complaint") or "N/A")[:60]
@@ -231,13 +232,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if patient:
             session["patient"] = patient
             await query.edit_message_text(
-                f"Da chon benh nhan: {patient['name']}\n"
-                "Mo ta trieu chung de bat dau tu van."
+                f"Đã chọn bệnh nhân: {patient['name']}\n"
+                "Mô tả triệu chứng để bắt đầu tư vấn."
             )
     elif data == "new_patient":
         session["state"] = "waiting_patient_name"
         await query.edit_message_text(
-            "Nhap ten benh nhan moi:"
+            "Nhập tên bệnh nhân mới:"
         )
 
 
@@ -249,7 +250,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if not message or len(message.strip()) < 3:
         await update.message.reply_text(
-            "Vui long mo ta chi tiet hon."
+            "Vui lòng mô tả chi tiết hơn."
         )
         return
 
@@ -259,8 +260,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         session["patient"] = patient
         session["state"] = "idle"
         await update.message.reply_text(
-            f"Da tao ho so: {patient['name']}\n"
-            "Mo ta trieu chung de bat dau tu van."
+            f"Đã tạo hồ sơ: {patient['name']}\n"
+            "Mô tả triệu chứng để bắt đầu tư vấn."
         )
         return
 
@@ -282,8 +283,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Notify processing
     processing_msg = await update.message.reply_text(
-        f"Dang tu van cho {patient['name']}...\n"
-        "(Gom nhieu buoc phan tich, vui long cho)"
+        f"Đang tư vấn cho {patient['name']}...\n"
+        "(Gồm nhiều bước phân tích, vui lòng chờ)"
     )
 
     try:
@@ -318,7 +319,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await context.bot.edit_message_text(
                 chat_id=update.effective_chat.id,
                 message_id=processing_msg.message_id,
-                text="Da hoan thanh tu van. Dung /report de xem bao cao chi tiet.",
+                text="Đã hoàn thành tư vấn. Dùng /report để xem báo cáo chi tiết.",
             )
 
         # Send report link
@@ -326,10 +327,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if report_path:
             report_id = Path(report_path).stem
             await update.message.reply_text(
-                f"Bao cao chi tiet:\n"
+                f"Báo cáo chi tiết:\n"
                 f"http://{WEB_HOST}:{WEB_PORT}/report/{report_id}\n\n"
-                f"Benh nhan: {patient['name']}\n"
-                "Luu y: Thong tin chi mang tinh tham khao."
+                f"Bệnh nhân: {patient['name']}\n"
+                "Lưu ý: Thông tin chỉ mang tính tham khảo."
             )
 
     except Exception as e:
@@ -338,9 +339,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             chat_id=update.effective_chat.id,
             message_id=processing_msg.message_id,
             text=(
-                "Xin loi, da co loi xay ra trong qua trinh tu van. "
-                "Vui long thu lai sau.\n\n"
-                "Neu khan cap, vui long goi 115 (VN) / 911 (US)."
+                "Xin lỗi, đã có lỗi xảy ra trong quá trình tư vấn. "
+                "Vui lòng thử lại sau.\n\n"
+                "Nếu khẩn cấp, vui lòng gọi 115 (VN) / 911 (US)."
             ),
         )
 
@@ -380,9 +381,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
     await update.message.reply_text(
-        f"Da luu anh vao ho so {patient['name']}.\n"
-        f"{'Mo ta: ' + caption if caption else ''}\n\n"
-        "Gui them thong tin hoac mo ta trieu chung de bat dau tu van."
+        f"Đã lưu ảnh vào hồ sơ {patient['name']}.\n"
+        f"{'Mô tả: ' + caption if caption else ''}\n\n"
+        "Gửi thêm thông tin hoặc mô tả triệu chứng để bắt đầu tư vấn."
     )
 
 
@@ -417,8 +418,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
     await update.message.reply_text(
-        f"Da luu file '{doc.file_name}' vao ho so {patient['name']}.\n\n"
-        "Gui them thong tin hoac mo ta trieu chung de bat dau tu van."
+        f"Đã lưu file '{doc.file_name}' vào hồ sơ {patient['name']}.\n\n"
+        "Gửi thêm thông tin hoặc mô tả triệu chứng để bắt đầu tư vấn."
     )
 
 
@@ -430,7 +431,7 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     consultations = db.get_consultations_by_user(user["id"], limit=1)
     if not consultations:
         await update.message.reply_text(
-            "Chua co bao cao nao. Gui tin nhan mo ta trieu chung de bat dau."
+            "Chưa có báo cáo nào. Gửi tin nhắn mô tả triệu chứng để bắt đầu."
         )
         return
 
@@ -442,7 +443,7 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if latest.get("consultation_id"):
         await update.message.reply_text(
-            f"Xem day du: http://{WEB_HOST}:{WEB_PORT}/report/{latest['consultation_id']}"
+            f"Xem đầy đủ: http://{WEB_HOST}:{WEB_PORT}/report/{latest['consultation_id']}"
         )
 
 
@@ -464,11 +465,27 @@ def _split_text(text: str, max_len: int = 4000) -> list[str]:
     return chunks
 
 
+def _start_web_server():
+    """Start Flask web server in a separate thread."""
+    try:
+        from web import app as flask_app
+        host = WEB_HOST if WEB_HOST != "45.32.110.105" else "0.0.0.0"
+        port = int(WEB_PORT)
+        logger.info(f"Web server starting on {host}:{port}")
+        flask_app.run(host=host, port=port, debug=False, use_reloader=False)
+    except Exception as e:
+        logger.error(f"Web server failed: {e}")
+
+
 def main():
-    """Start the Telegram bot."""
+    """Start the Telegram bot and web server."""
     if not BOT_TOKEN:
         print("ERROR: Set TELEGRAM_BOT_TOKEN environment variable")
         return
+
+    # Start web server in background thread
+    web_thread = threading.Thread(target=_start_web_server, daemon=True)
+    web_thread.start()
 
     app = Application.builder().token(BOT_TOKEN).build()
 

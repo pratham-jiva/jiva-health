@@ -30,9 +30,9 @@ EMERGENCY_KEYWORDS = [
     "sot cao", "co giat", "dot quy", "nhoi mau"
 ]
 
-DISCLAIMER_VN = """THONG BAO: Day chi la thong tin tham khao, KHONG phai chan doan y khoa.
-Vui long tham khao y kien bac si cho moi quyet dinh dieu tri.
-KHAN CAP: Goi 115 (VN) / 911 (US)"""
+DISCLAIMER_VN = """THÔNG BÁO: Đây chỉ là thông tin tham khảo, KHÔNG phải chẩn đoán y khoa.
+Vui lòng tham khảo ý kiến bác sĩ cho mọi quyết định điều trị.
+KHẨN CẤP: Gọi 115 (VN) / 911 (US)"""
 
 DISCLAIMER_EN = """DISCLAIMER: This is for informational purposes only, NOT medical diagnosis.
 Please consult your doctor for all treatment decisions.
@@ -213,13 +213,13 @@ class HealthOrchestrator:
                 "is_emergency": True,
                 "keywords": found,
                 "message": (
-                    "CANH BAO KHAN CAP\n\n"
-                    f"Phat hien trieu chung khan cap: {', '.join(found)}\n\n"
-                    "GOI NGAY:\n"
-                    "VN: 115 (Cap cuu)\n"
+                    "CẢNH BÁO KHẨN CẤP\n\n"
+                    f"Phát hiện triệu chứng khẩn cấp: {', '.join(found)}\n\n"
+                    "GỌI NGAY:\n"
+                    "VN: 115 (Cấp cứu)\n"
                     "US: 911 (Emergency)\n\n"
-                    "Day co the la tinh huong can cap cuu. "
-                    "Vui long den co so y te gan nhat NGAY."
+                    "Đây có thể là tình huống cần cấp cứu. "
+                    "Vui lòng đến cơ sở y tế gần nhất NGAY."
                 ),
             }
         return {"is_emergency": False}
