@@ -2,6 +2,7 @@
 Jiva Health Orchestrator
 Dieu phoi 8-step consultation workflow.
 Dung Claude Code CLI (subprocess) thay vi Anthropic API.
+Luu tat ca vao SQLite database.
 """
 
 import json
@@ -12,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from agents import consultant, research, evaluator, causes, solutions
+import database as db
 
 # --- Config ---
 CLAUDE_BIN = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
@@ -24,8 +26,8 @@ EMERGENCY_KEYWORDS = [
     "sot cao", "co giat", "chest pain", "difficulty breathing",
     "unconscious", "heavy bleeding", "high fever", "seizure",
     "dot quy", "stroke", "heart attack", "nhoi mau",
-    "đau ngực", "khó thở", "mất ý thức", "chảy máu nặng",
-    "sốt cao", "co giật", "đột quỵ", "nhồi máu"
+    "dau nguc", "kho tho", "mat y thuc", "chay mau nang",
+    "sot cao", "co giat", "dot quy", "nhoi mau"
 ]
 
 DISCLAIMER_VN = """THONG BAO: Day chi la thong tin tham khao, KHONG phai chan doan y khoa.
@@ -38,11 +40,7 @@ EMERGENCY: Call 115 (VN) / 911 (US)"""
 
 
 def _call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 4000) -> str:
-    """Call Claude Code CLI in print mode.
-
-    Uses: claude -p "prompt" --model sonnet --no-session-persistence
-    System prompt is prepended to user prompt since CLI has no --system flag.
-    """
+    """Call Claude Code CLI in print mode."""
     full_prompt = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{user_prompt}"
 
     cmd = [
@@ -71,7 +69,9 @@ def _call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 4000) -
 class HealthOrchestrator:
     """Orchestrates the 8-step health consultation workflow."""
 
-    def __init__(self):
+    def __init__(self, user_id: int = None, patient_id: int = None):
+        self.user_id = user_id
+        self.patient_id = patient_id
         self.consultation = {
             "id": None,
             "started_at": None,
@@ -91,11 +91,35 @@ class HealthOrchestrator:
         self.consultation["id"] = consultation_id
         self.consultation["started_at"] = datetime.now().isoformat()
 
+        # Create consultation record in DB
+        db_consultation = None
+        if self.user_id:
+            db_consultation = db.create_consultation(
+                consultation_id=consultation_id,
+                user_id=self.user_id,
+                patient_id=self.patient_id,
+                raw_message=patient_message,
+            )
+            # Save user message
+            db.save_message(
+                user_id=self.user_id,
+                role="user",
+                content=patient_message,
+                consultation_id=db_consultation["id"],
+            )
+
         steps = {}
 
         # Step 0: Emergency Check
         emergency = self._check_emergency(patient_message)
         if emergency["is_emergency"]:
+            if db_consultation:
+                db.update_consultation(
+                    consultation_id,
+                    is_emergency=1,
+                    status="emergency",
+                    completed_at=datetime.now().isoformat(),
+                )
             return {
                 "id": consultation_id,
                 "emergency": True,
@@ -108,21 +132,29 @@ class HealthOrchestrator:
         profile = self._quick_intake(patient_message)
         self.consultation["patient_profile"] = profile
         steps["intake"] = "done"
+        if db_consultation:
+            db.update_consultation(consultation_id, patient_profile=profile.get("extracted", ""))
 
         # Step 2: Research
         research_result = self._run_research(profile)
         self.consultation["research_findings"] = research_result
         steps["research"] = "done"
+        if db_consultation:
+            db.update_consultation(consultation_id, research_findings=research_result)
 
         # Step 3: Status Assessment
         eval_result = self._run_eval(profile, research_result)
         self.consultation["status_assessment"] = eval_result
         steps["eval"] = "done"
+        if db_consultation:
+            db.update_consultation(consultation_id, status_assessment=eval_result)
 
         # Step 4: Cause Analysis
         causes_result = self._run_causes(profile, research_result)
         self.consultation["causal_analysis"] = causes_result
         steps["causes"] = "done"
+        if db_consultation:
+            db.update_consultation(consultation_id, causal_analysis=causes_result)
 
         # Step 5: Solutions
         solutions_result = self._run_solutions(
@@ -130,6 +162,8 @@ class HealthOrchestrator:
         )
         self.consultation["solutions"] = solutions_result
         steps["solutions"] = "done"
+        if db_consultation:
+            db.update_consultation(consultation_id, solutions=solutions_result)
 
         # Step 6: Synthesis - Generate Report
         report = self._synthesize_report()
@@ -141,8 +175,24 @@ class HealthOrchestrator:
         self.consultation["handoff"] = handoff
         steps["handoff"] = "done"
 
-        # Save report
+        # Save report to file
         report_path = self._save_report(consultation_id, report)
+
+        # Update DB with final results
+        if db_consultation:
+            db.update_consultation(
+                consultation_id,
+                report=report,
+                handoff=handoff,
+                status="completed",
+                completed_at=datetime.now().isoformat(),
+            )
+            db.save_message(
+                user_id=self.user_id,
+                role="assistant",
+                content=handoff,
+                consultation_id=db_consultation["id"],
+            )
 
         return {
             "id": consultation_id,
@@ -176,13 +226,40 @@ class HealthOrchestrator:
 
     def _quick_intake(self, message: str) -> dict:
         """Step 1: Extract patient profile from message."""
+        # Include patient history if available
+        patient_context = ""
+        if self.patient_id:
+            patient = db.get_patient(self.patient_id)
+            if patient:
+                patient_context = (
+                    f"\nThong tin benh nhan da biet:\n"
+                    f"- Ten: {patient.get('name', 'N/A')}\n"
+                    f"- Tuoi: {patient.get('age', 'N/A')}\n"
+                    f"- Gioi: {patient.get('gender', 'N/A')}\n"
+                    f"- Tien su: {patient.get('medical_history', 'N/A')}\n"
+                    f"- Di ung: {patient.get('allergies', 'N/A')}\n"
+                    f"- Thuoc hien tai: {patient.get('current_medications', 'N/A')}\n"
+                )
+
+        # Include recent consultation history
+        history_context = ""
+        if self.patient_id:
+            past = db.get_consultations_by_patient(self.patient_id, limit=3)
+            if past:
+                history_context = "\nLich su kham gan day:\n"
+                for c in past:
+                    if c.get("chief_complaint"):
+                        history_context += f"- {c['created_at'][:10]}: {c['chief_complaint'][:100]}\n"
+
         response = _call_claude(
             system_prompt=consultant.SYSTEM_PROMPT,
             user_prompt=(
                 f"Benh nhan gui tin nhan sau. "
                 f"Trich xuat Patient Profile tu thong tin co san. "
                 f"Nhung gi chua biet thi ghi 'chua ro'.\n\n"
-                f"Tin nhan: {message}\n\n"
+                f"{patient_context}"
+                f"{history_context}"
+                f"\nTin nhan: {message}\n\n"
                 f"Output YAML patient_profile."
             ),
         )
@@ -303,9 +380,9 @@ Format:
 
 # --- Convenience ---
 
-def run_consultation(message: str) -> dict:
+def run_consultation(message: str, user_id: int = None, patient_id: int = None) -> dict:
     """Quick function to run a full consultation."""
-    orchestrator = HealthOrchestrator()
+    orchestrator = HealthOrchestrator(user_id=user_id, patient_id=patient_id)
     return orchestrator.start_consultation(message)
 
 

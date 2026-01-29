@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Patients - Jiva Health</title>
+    <style>
+        :root {
+            --bg: #0f172a; --surface: #1e293b; --border: #334155;
+            --text: #e2e8f0; --text-muted: #94a3b8;
+            --accent: #38bdf8; --green: #4ade80; --yellow: #fbbf24;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg); color: var(--text); min-height: 100vh;
+        }
+        .container { max-width: 900px; margin: 0 auto; padding: 2rem 1rem; }
+        header { text-align: center; margin-bottom: 2rem; padding: 2rem 0; border-bottom: 1px solid var(--border); }
+        header h1 {
+            font-size: 2rem; font-weight: 700;
+            background: linear-gradient(135deg, var(--accent), var(--green));
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+        header p { color: var(--text-muted); }
+        nav { display: flex; gap: 1rem; justify-content: center; margin-bottom: 2rem; }
+        nav a {
+            color: var(--accent); text-decoration: none;
+            padding: 0.5rem 1rem; border: 1px solid var(--border);
+            border-radius: 8px; font-size: 0.9rem;
+        }
+        nav a:hover { border-color: var(--accent); }
+        nav a.active { background: rgba(56,189,248,0.1); border-color: var(--accent); }
+        .patients-list { display: flex; flex-direction: column; gap: 1rem; }
+        .patient-card {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: 12px; padding: 1.5rem;
+            text-decoration: none; color: var(--text);
+            transition: all 0.2s; display: flex; align-items: center; gap: 1.5rem;
+        }
+        .patient-card:hover {
+            border-color: var(--accent); transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(56,189,248,0.1);
+        }
+        .patient-icon {
+            width: 48px; height: 48px; background: rgba(74,222,128,0.1);
+            border-radius: 50%; display: flex; align-items: center; justify-content: center;
+            font-size: 1.5rem; flex-shrink: 0;
+        }
+        .patient-info { flex: 1; }
+        .patient-info h3 { font-size: 1rem; margin-bottom: 0.25rem; }
+        .patient-info .meta { color: var(--text-muted); font-size: 0.8rem; }
+        .patient-info .details { font-size: 0.85rem; color: var(--text-muted); margin-top: 0.25rem; }
+        .badge {
+            font-size: 0.7rem; padding: 2px 8px; border-radius: 4px;
+            background: rgba(56,189,248,0.1); color: var(--accent);
+            display: inline-block; margin-left: 0.5rem;
+        }
+        .empty-state { text-align: center; padding: 4rem 2rem; color: var(--text-muted); }
+        footer {
+            text-align: center; margin-top: 4rem; padding: 2rem 0;
+            border-top: 1px solid var(--border); color: var(--text-muted); font-size: 0.8rem;
+        }
+        footer a { color: var(--accent); text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Jiva Health</h1>
+            <p>Patient Records</p>
+        </header>
+
+        <nav>
+            <a href="/">Consultations</a>
+            <a href="/patients" class="active">Patients</a>
+        </nav>
+
+        {% if patients %}
+        <div class="patients-list">
+            {% for p in patients %}
+            <a href="/patient/{{ p.id }}" class="patient-card">
+                <div class="patient-icon">&#x1F464;</div>
+                <div class="patient-info">
+                    <h3>
+                        {{ p.name }}
+                        {% if p.alias == 'self' %}<span class="badge">self</span>{% endif %}
+                    </h3>
+                    <div class="details">
+                        {% if p.age %}{{ p.age }}{% endif %}
+                        {% if p.gender %} &middot; {{ p.gender }}{% endif %}
+                        &middot; {{ p.consultation_count }} consultation(s)
+                    </div>
+                    <div class="meta">
+                        Added: {{ p.created_at[:10] }}
+                        {% if p.user_name %} &middot; by {{ p.user_name }}{% endif %}
+                    </div>
+                </div>
+            </a>
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty-state">
+            <p>Chua co benh nhan nao.</p>
+            <p>Gui tin nhan qua Telegram <strong>@pratham_jiva_bot</strong> de bat dau.</p>
+        </div>
+        {% endif %}
+
+        <footer>
+            <p>Powered by <a href="https://github.com/pratham-jiva">Pratham Jiva</a></p>
+        </footer>
+    </div>
+</body>
+</html>

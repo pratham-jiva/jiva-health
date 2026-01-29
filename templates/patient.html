@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ patient.name }} - Jiva Health</title>
+    <style>
+        :root {
+            --bg: #0f172a; --surface: #1e293b; --border: #334155;
+            --text: #e2e8f0; --text-muted: #94a3b8;
+            --accent: #38bdf8; --green: #4ade80; --yellow: #fbbf24; --red: #f87171;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg); color: var(--text); min-height: 100vh;
+        }
+        .container { max-width: 900px; margin: 0 auto; padding: 2rem 1rem; }
+        .back-link {
+            display: inline-block; color: var(--accent); text-decoration: none;
+            margin-bottom: 1.5rem; font-size: 0.9rem;
+        }
+        .profile-card {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: 12px; padding: 2rem; margin-bottom: 2rem;
+        }
+        .profile-card h1 { font-size: 1.5rem; margin-bottom: 1rem; color: var(--accent); }
+        .profile-grid {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem;
+        }
+        .profile-field { }
+        .profile-field label { font-size: 0.8rem; color: var(--text-muted); display: block; }
+        .profile-field .value { font-size: 0.95rem; }
+        .section {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem;
+        }
+        .section h2 {
+            font-size: 1.1rem; color: var(--green); margin-bottom: 1rem;
+            padding-bottom: 0.5rem; border-bottom: 1px solid var(--border);
+        }
+        .consultation-item {
+            padding: 0.75rem 0; border-bottom: 1px solid var(--border);
+        }
+        .consultation-item:last-child { border-bottom: none; }
+        .consultation-item a { color: var(--accent); text-decoration: none; }
+        .consultation-item a:hover { text-decoration: underline; }
+        .consultation-item .complaint { font-size: 0.9rem; }
+        .consultation-item .meta { font-size: 0.8rem; color: var(--text-muted); }
+        .status-badge {
+            font-size: 0.7rem; padding: 2px 8px; border-radius: 4px;
+            display: inline-block;
+        }
+        .status-completed { background: rgba(74,222,128,0.15); color: var(--green); }
+        .status-emergency { background: rgba(248,113,113,0.15); color: var(--red); }
+        .status-in_progress { background: rgba(251,191,36,0.15); color: var(--yellow); }
+        .att-list { list-style: none; }
+        .att-list li { padding: 0.5rem 0; border-bottom: 1px solid var(--border); }
+        .att-list li:last-child { border-bottom: none; }
+        .att-list a { color: var(--accent); text-decoration: none; }
+        .att-list .att-meta { font-size: 0.8rem; color: var(--text-muted); }
+        .att-thumb {
+            max-width: 120px; max-height: 80px; border-radius: 4px;
+            margin-top: 0.25rem; display: block;
+        }
+        footer {
+            text-align: center; margin-top: 3rem; padding: 1.5rem 0;
+            border-top: 1px solid var(--border); color: var(--text-muted); font-size: 0.8rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <a href="/patients" class="back-link">&larr; All Patients</a>
+
+        <div class="profile-card">
+            <h1>{{ patient.name }}</h1>
+            <div class="profile-grid">
+                <div class="profile-field">
+                    <label>Age</label>
+                    <div class="value">{{ patient.age or 'N/A' }}</div>
+                </div>
+                <div class="profile-field">
+                    <label>Gender</label>
+                    <div class="value">{{ patient.gender or 'N/A' }}</div>
+                </div>
+                <div class="profile-field">
+                    <label>Phone</label>
+                    <div class="value">{{ patient.phone or 'N/A' }}</div>
+                </div>
+                <div class="profile-field">
+                    <label>Created</label>
+                    <div class="value">{{ patient.created_at[:10] }}</div>
+                </div>
+            </div>
+            {% if patient.medical_history %}
+            <div class="profile-field" style="margin-top:1rem">
+                <label>Medical History</label>
+                <div class="value">{{ patient.medical_history }}</div>
+            </div>
+            {% endif %}
+            {% if patient.allergies %}
+            <div class="profile-field" style="margin-top:0.5rem">
+                <label>Allergies</label>
+                <div class="value">{{ patient.allergies }}</div>
+            </div>
+            {% endif %}
+            {% if patient.current_medications %}
+            <div class="profile-field" style="margin-top:0.5rem">
+                <label>Current Medications</label>
+                <div class="value">{{ patient.current_medications }}</div>
+            </div>
+            {% endif %}
+            {% if patient.notes %}
+            <div class="profile-field" style="margin-top:0.5rem">
+                <label>Notes</label>
+                <div class="value">{{ patient.notes }}</div>
+            </div>
+            {% endif %}
+        </div>
+
+        {% if consultations %}
+        <div class="section">
+            <h2>Consultation History ({{ consultations|length }})</h2>
+            {% for c in consultations %}
+            <div class="consultation-item">
+                <a href="/report/{{ c.consultation_id }}">
+                    {{ c.created_at[:16] }}
+                    <span class="status-badge status-{{ c.status }}">{{ c.status }}</span>
+                </a>
+                <div class="complaint">{{ (c.chief_complaint or '')[:100] }}</div>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        {% if attachments %}
+        <div class="section">
+            <h2>Attachments ({{ attachments|length }})</h2>
+            <ul class="att-list">
+                {% for att in attachments %}
+                <li>
+                    <a href="/attachment/{{ att.id }}">{{ att.original_name }}</a>
+                    <span class="att-meta"> &middot; {{ att.file_type }} &middot; {{ att.file_size }} bytes &middot; {{ att.uploaded_at[:10] }}</span>
+                    {% if att.description %}<br><span class="att-meta">{{ att.description }}</span>{% endif %}
+                    {% if att.file_type == 'image' %}
+                    <img src="/attachment/{{ att.id }}" class="att-thumb" alt="{{ att.original_name }}">
+                    {% endif %}
+                </li>
+                {% endfor %}
+            </ul>
+        </div>
+        {% endif %}
+
+        <footer>
+            Powered by Pratham Jiva &middot; Khong thay the kham truc tiep
+        </footer>
+    </div>
+</body>
+</html>

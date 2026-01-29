@@ -27,7 +27,7 @@
         .container { max-width: 900px; margin: 0 auto; padding: 2rem 1rem; }
         header {
             text-align: center;
-            margin-bottom: 3rem;
+            margin-bottom: 2rem;
             padding: 2rem 0;
             border-bottom: 1px solid var(--border);
         }
@@ -40,6 +40,17 @@
             margin-bottom: 0.5rem;
         }
         header p { color: var(--text-muted); font-size: 1rem; }
+        nav {
+            display: flex; gap: 1rem; justify-content: center;
+            margin-bottom: 2rem;
+        }
+        nav a {
+            color: var(--accent); text-decoration: none;
+            padding: 0.5rem 1rem; border: 1px solid var(--border);
+            border-radius: 8px; font-size: 0.9rem;
+        }
+        nav a:hover { border-color: var(--accent); }
+        nav a.active { background: rgba(56,189,248,0.1); border-color: var(--accent); }
         .disclaimer {
             background: #1e1b0f;
             border: 1px solid #854d0e;
@@ -78,10 +89,15 @@
         }
         .report-info { flex: 1; }
         .report-info h3 { font-size: 1rem; margin-bottom: 0.25rem; }
-        .report-info .meta {
-            color: var(--text-muted);
-            font-size: 0.8rem;
+        .report-info .meta { color: var(--text-muted); font-size: 0.8rem; }
+        .report-info .complaint { font-size: 0.85rem; color: var(--text-muted); margin-top: 0.25rem; }
+        .status-badge {
+            font-size: 0.7rem; padding: 2px 8px; border-radius: 4px;
+            display: inline-block; margin-left: 0.5rem;
         }
+        .status-completed { background: rgba(74,222,128,0.15); color: var(--green); }
+        .status-emergency { background: rgba(248,113,113,0.15); color: var(--red); }
+        .status-in_progress { background: rgba(251,191,36,0.15); color: var(--yellow); }
         .empty-state {
             text-align: center;
             padding: 4rem 2rem;
@@ -106,20 +122,32 @@
             <p>AI Medical Consultation Reports</p>
         </header>
 
+        <nav>
+            <a href="/" class="active">Consultations</a>
+            <a href="/patients">Patients</a>
+        </nav>
+
         <div class="disclaimer">
             Thong tin tren trang nay chi mang tinh chat tham khao, KHONG phai chan doan y khoa.
             Vui long tham khao y kien bac si cho moi quyet dinh dieu tri.
             Khan cap: Goi 115 (VN) / 911 (US).
         </div>
 
-        {% if reports %}
+        {% if consultations %}
         <div class="reports-list">
-            {% for r in reports %}
-            <a href="/report/{{ r.id }}" class="report-card">
+            {% for c in consultations %}
+            <a href="/report/{{ c.consultation_id }}" class="report-card">
                 <div class="report-icon">&#x1F4CB;</div>
                 <div class="report-info">
-                    <h3>Consultation {{ r.id }}</h3>
-                    <div class="meta">{{ r.date }} &middot; {{ r.size }} bytes</div>
+                    <h3>
+                        {{ c.patient_name or 'Unknown' }}
+                        <span class="status-badge status-{{ c.status }}">{{ c.status }}</span>
+                    </h3>
+                    <div class="complaint">{{ (c.chief_complaint or '')[:80] }}</div>
+                    <div class="meta">
+                        {{ c.created_at[:16] }}
+                        {% if c.user_name %} &middot; by {{ c.user_name }}{% endif %}
+                    </div>
                 </div>
             </a>
             {% endfor %}

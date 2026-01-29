@@ -45,6 +45,34 @@
             color: var(--text-muted);
             font-size: 0.85rem;
         }
+        .patient-info {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem 1.5rem;
+            margin-bottom: 1.5rem;
+            font-size: 0.9rem;
+        }
+        .patient-info h3 { color: var(--accent); margin-bottom: 0.5rem; font-size: 1rem; }
+        .patient-info .field { color: var(--text-muted); margin-bottom: 0.25rem; }
+        .patient-info .field strong { color: var(--text); }
+        .attachments-section {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+        .attachments-section h3 { color: var(--accent); margin-bottom: 0.5rem; font-size: 1rem; }
+        .att-list { list-style: none; }
+        .att-list li {
+            padding: 0.5rem 0;
+            border-bottom: 1px solid var(--border);
+        }
+        .att-list li:last-child { border-bottom: none; }
+        .att-list a { color: var(--accent); text-decoration: none; }
+        .att-list a:hover { text-decoration: underline; }
+        .att-list .att-meta { font-size: 0.8rem; color: var(--text-muted); }
         .disclaimer {
             background: #1e1b0f;
             border: 1px solid #854d0e;
@@ -63,83 +91,85 @@
             line-height: 1.8;
         }
         .report-content h1 {
-            font-size: 1.5rem;
-            color: var(--accent);
-            margin: 2rem 0 1rem;
-            padding-bottom: 0.5rem;
+            font-size: 1.5rem; color: var(--accent);
+            margin: 2rem 0 1rem; padding-bottom: 0.5rem;
             border-bottom: 1px solid var(--border);
         }
         .report-content h1:first-child { margin-top: 0; }
-        .report-content h2 {
-            font-size: 1.2rem;
-            color: var(--green);
-            margin: 1.5rem 0 0.75rem;
-        }
-        .report-content h3 {
-            font-size: 1rem;
-            color: var(--accent);
-            margin: 1rem 0 0.5rem;
-        }
+        .report-content h2 { font-size: 1.2rem; color: var(--green); margin: 1.5rem 0 0.75rem; }
+        .report-content h3 { font-size: 1rem; color: var(--accent); margin: 1rem 0 0.5rem; }
         .report-content p { margin-bottom: 0.75rem; }
-        .report-content ul, .report-content ol {
-            margin: 0.5rem 0 1rem 1.5rem;
-        }
+        .report-content ul, .report-content ol { margin: 0.5rem 0 1rem 1.5rem; }
         .report-content li { margin-bottom: 0.4rem; }
         .report-content code {
             background: rgba(56, 189, 248, 0.1);
-            padding: 0.15rem 0.4rem;
-            border-radius: 4px;
-            font-size: 0.85em;
+            padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.85em;
         }
         .report-content pre {
-            background: var(--bg);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 1rem;
-            overflow-x: auto;
-            margin: 1rem 0;
+            background: var(--bg); border: 1px solid var(--border);
+            border-radius: 8px; padding: 1rem; overflow-x: auto; margin: 1rem 0;
         }
-        .report-content pre code {
-            background: none;
-            padding: 0;
-        }
+        .report-content pre code { background: none; padding: 0; }
         .report-content strong { color: var(--accent); }
         .report-content blockquote {
             border-left: 3px solid var(--accent);
-            padding-left: 1rem;
-            color: var(--text-muted);
-            margin: 1rem 0;
+            padding-left: 1rem; color: var(--text-muted); margin: 1rem 0;
         }
-        .report-content table {
-            width: 100%;
-            border-collapse: collapse;
-            margin: 1rem 0;
-        }
+        .report-content table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
         .report-content th, .report-content td {
-            border: 1px solid var(--border);
-            padding: 0.5rem 0.75rem;
-            text-align: left;
+            border: 1px solid var(--border); padding: 0.5rem 0.75rem; text-align: left;
         }
         .report-content th { background: var(--bg); }
         footer {
-            text-align: center;
-            margin-top: 3rem;
-            padding: 1.5rem 0;
-            border-top: 1px solid var(--border);
-            color: var(--text-muted);
-            font-size: 0.8rem;
+            text-align: center; margin-top: 3rem; padding: 1.5rem 0;
+            border-top: 1px solid var(--border); color: var(--text-muted); font-size: 0.8rem;
         }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
 <body>
     <div class="container">
-        <a href="/" class="back-link">&larr; All Reports</a>
+        <a href="/" class="back-link">&larr; All Consultations</a>
 
         <div class="report-header">
             <h1>Consultation Report</h1>
-            <div class="meta">ID: {{ report_id }}</div>
+            <div class="meta">
+                ID: {{ report_id }}
+                {% if consultation %}
+                    &middot; {{ consultation.created_at[:16] }}
+                    {% if consultation.status == 'completed' %} &middot; Completed{% endif %}
+                {% endif %}
+            </div>
         </div>
+
+        {% if patient %}
+        <div class="patient-info">
+            <h3>Patient: {{ patient.name }}</h3>
+            {% if patient.age %}<div class="field"><strong>Age:</strong> {{ patient.age }}</div>{% endif %}
+            {% if patient.gender %}<div class="field"><strong>Gender:</strong> {{ patient.gender }}</div>{% endif %}
+            {% if patient.medical_history %}<div class="field"><strong>History:</strong> {{ patient.medical_history }}</div>{% endif %}
+            {% if patient.allergies %}<div class="field"><strong>Allergies:</strong> {{ patient.allergies }}</div>{% endif %}
+            {% if patient.current_medications %}<div class="field"><strong>Medications:</strong> {{ patient.current_medications }}</div>{% endif %}
+            <div class="field" style="margin-top:0.5rem">
+                <a href="/patient/{{ patient.id }}" style="color:var(--accent);text-decoration:none">View full profile &rarr;</a>
+            </div>
+        </div>
+        {% endif %}
+
+        {% if attachments %}
+        <div class="attachments-section">
+            <h3>Attachments</h3>
+            <ul class="att-list">
+                {% for att in attachments %}
+                <li>
+                    <a href="/attachment/{{ att.id }}">{{ att.original_name }}</a>
+                    <span class="att-meta"> &middot; {{ att.file_type }} &middot; {{ att.file_size }} bytes</span>
+                    {% if att.description %}<br><span class="att-meta">{{ att.description }}</span>{% endif %}
+                </li>
+                {% endfor %}
+            </ul>
+        </div>
+        {% endif %}
 
         <div class="disclaimer">
             Thong tin tren trang nay chi mang tinh chat tham khao, KHONG phai chan doan y khoa.
