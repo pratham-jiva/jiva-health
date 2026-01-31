@@ -7,13 +7,32 @@ Luu tat ca vao SQLite database.
 
 import json
 import os
-import subprocess
+import subprocess  # kept as fallback
+
+# LLM Router (replaces claude subprocess)
+import sys
+sys.path.insert(0, '/home/jiva/pratham-home/tools')
+from dotenv import load_dotenv
+load_dotenv('/home/jiva/pratham-home/.env')
+
+try:
+    from llm_provider import llm_complete
+    HAS_LLM_ROUTER = True
+except ImportError:
+    HAS_LLM_ROUTER = False
 import shutil
 from datetime import datetime
 from pathlib import Path
 
 from agents import consultant, research, evaluator, causes, solutions
 import database as db
+
+# Bridge to Jiva core memory (5W1H)
+try:
+    from jiva_memory_bridge import sync_consultation_to_core
+    HAS_MEMORY_BRIDGE = True
+except ImportError:
+    HAS_MEMORY_BRIDGE = False
 
 # --- Config ---
 CLAUDE_BIN = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
@@ -42,8 +61,24 @@ EMERGENCY: Call 115 (VN) / 911 (US)"""
 NEED_MORE_INFO_TAG = "[NEED_MORE_INFO]"
 
 
-def _build_mcp_config(session_id: str) -> str:
-    """Build MCP config JSON for ask_patient tool."""
+def _build_mcp_config(session_id: str, chat_id: int = None) -> str:
+    """Build MCP config JSON for ask_patient tool.
+
+    Args:
+        session_id: Consultation session ID for IPC state matching.
+        chat_id: Telegram chat_id of the patient. If provided, MCP subprocess
+                 can send questions directly to Telegram.
+    """
+    env = {
+        "JIVA_SESSION_ID": session_id,
+    }
+    # Pass Telegram credentials so MCP subprocess can send messages directly
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if bot_token:
+        env["TELEGRAM_BOT_TOKEN"] = bot_token
+    if chat_id:
+        env["TELEGRAM_CHAT_ID"] = str(chat_id)
+
     config = {
         "mcpServers": {
             "jiva_health": {
@@ -51,9 +86,7 @@ def _build_mcp_config(session_id: str) -> str:
                 "args": [
                     str(Path(__file__).parent / "tools" / "ask_patient.py"),
                 ],
-                "env": {
-                    "JIVA_SESSION_ID": session_id,
-                },
+                "env": env,
             }
         }
     }
@@ -63,7 +96,8 @@ def _build_mcp_config(session_id: str) -> str:
 def _call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 4000,
                   allowed_tools: list[str] | None = None,
                   session_id: str | None = None,
-                  model: str | None = None) -> str:
+                  model: str | None = None,
+                  chat_id: int = None) -> str:
     """Call Claude Code CLI in print mode.
 
     Args:
@@ -75,13 +109,28 @@ def _call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 4000,
         session_id: Session ID for MCP ask_patient tool. Required when
                     allowed_tools includes ask_patient.
         model: Model to use. Defaults to MODEL (sonnet). Use "haiku" for fast steps.
+        chat_id: Telegram chat_id of the patient for direct messaging.
     """
     use_model = model or MODEL
-    full_prompt = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{user_prompt}"
+
+    # Use LLM Router if available (no MCP tools needed)
+    if HAS_LLM_ROUTER and not allowed_tools and not session_id:
+        try:
+            tier = "fast" if use_model == "haiku" else ("thinking" if use_model in ("opus", "thinking") else "balanced")
+            full_prompt = user_prompt
+            result = llm_complete(full_prompt, tier=tier, system=system_prompt)
+            output = result.content.strip()
+            if output:
+                return output
+            raise RuntimeError("LLM Router returned empty output")
+        except Exception as e:
+            # Fall through to subprocess
+            pass
 
     cmd = [
         CLAUDE_BIN,
-        "-p", full_prompt,
+        "-p", user_prompt,
+        "--system-prompt", system_prompt,
         "--model", use_model,
         "--no-session-persistence",
         "--output-format", "text",
@@ -89,15 +138,15 @@ def _call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 4000,
 
     # Add MCP config if session_id provided (for ask_patient tool)
     if session_id:
-        cmd.extend(["--mcp-config", _build_mcp_config(session_id)])
+        cmd.extend(["--mcp-config", _build_mcp_config(session_id, chat_id=chat_id)])
 
     # Only add allowedTools when explicitly specified with tools.
     # If None: don't pass flag at all (agent has no tools by default).
     if allowed_tools is not None:
         cmd.extend(["--allowedTools", ",".join(allowed_tools)])
 
-    # Longer timeout when MCP tools are active (waiting for patient reply)
-    timeout = 600 if session_id else 300
+    # Timeout for Claude CLI
+    timeout = 300
 
     try:
         result = subprocess.run(
@@ -108,8 +157,12 @@ def _call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 4000,
             cwd=str(Path(__file__).parent),
         )
         if result.returncode != 0:
-            raise RuntimeError(f"Claude CLI error: {result.stderr[:500]}")
-        return result.stdout.strip()
+            err = result.stderr[:500] or result.stdout[:500] or f"exit code {result.returncode}"
+            raise RuntimeError(f"Claude CLI error: {err}")
+        output = result.stdout.strip()
+        if not output:
+            raise RuntimeError("Claude CLI returned empty output")
+        return output
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"Claude CLI timed out ({timeout}s)")
 
@@ -134,9 +187,10 @@ class HealthOrchestrator:
 
     def __init__(self, user_id: int = None, patient_id: int = None,
                  on_step_start=None, on_step_done=None,
-                 consultation_id: str = None):
+                 consultation_id: str = None, chat_id: int = None):
         self.user_id = user_id
         self.patient_id = patient_id
+        self.chat_id = chat_id  # Telegram chat_id for direct messaging
         self.on_step_start = on_step_start  # callback(step_name, step_desc)
         self.on_step_done = on_step_done    # callback(step_name, step_desc)
         self._preset_consultation_id = consultation_id  # allow caller to set ID
@@ -231,10 +285,11 @@ class HealthOrchestrator:
         self._notify("interview", "start")
         self.interview_history = [{"role": "user", "content": patient_message}]
 
-        response = self._run_consultant_interview(patient_message)
+        interview_result = self._run_consultant_interview(patient_message)
 
-        # Consultant should always end with [INTAKE_COMPLETE] + profile
-        if "[INTAKE_COMPLETE]" in response:
+        if interview_result["complete"]:
+            # Claude has enough info, proceed to analysis
+            response = interview_result["response"]
             self.consultation["patient_profile"] = {
                 "raw_message": patient_message,
                 "extracted": response,
@@ -244,20 +299,21 @@ class HealthOrchestrator:
                     self.consultation["id"],
                     patient_profile=response,
                 )
+            self._extract_and_save_facts(response, patient_message)
+            self._notify("interview", "done")
+            return self._run_analysis_phase()
         else:
-            # Fallback: treat entire response as profile
-            self.consultation["patient_profile"] = {
-                "raw_message": patient_message,
-                "extracted": response,
+            # Claude needs more info - return questions to bot
+            self.consultation["interview_questions"] = interview_result.get("questions", "")
+            self.consultation["original_message"] = patient_message
+            return {
+                "id": self.consultation["id"],
+                "emergency": False,
+                "needs_interview": True,
+                "interview_greeting": interview_result.get("greeting", ""),
+                "interview_questions": interview_result.get("questions", ""),
+                "consultation_id": self.consultation["id"],
             }
-
-        # Extract and save user facts from interview
-        self._extract_and_save_facts(response, patient_message)
-
-        self._notify("interview", "done")
-
-        # Proceed to analysis phase
-        return self._run_analysis_phase()
 
     def continue_interview(self, user_reply: str) -> dict:
         """Phase 1 continued: Process user's reply to interview question.
@@ -343,19 +399,17 @@ class HealthOrchestrator:
             complaint, source=source,
         )
 
-    def _run_consultant_interview(self, patient_message: str) -> str:
-        """Run consultant interview using MCP ask_patient tool.
+    def _run_consultant_interview(self, patient_message: str) -> dict:
+        """Run consultant interview - DIRECT approach (no MCP).
 
-        The consultant agent handles the entire interview autonomously:
-        - Reads initial patient message
-        - Uses ask_patient tool to ask follow-up questions (max 3)
-        - Returns [INTAKE_COMPLETE] + YAML profile when done
+        Instead of MCP tool calls, Claude outputs questions directly.
+        Bot sends questions to patient, collects answers, feeds back.
 
-        Returns: Full consultant response with [INTAKE_COMPLETE] and profile.
+        Returns dict:
+            {"complete": True, "response": "...[INTAKE_COMPLETE]..."}
+            {"complete": False, "questions": "Q1\nQ2\n...", "greeting": "..."}
         """
-        session_id = self.consultation["id"]
-
-        # User memory context (what Jiva knows about this user from past interactions)
+        # User memory context
         user_memory = ""
         if self.user_id:
             user_memory = db.get_user_context_summary(self.user_id)
@@ -366,45 +420,126 @@ class HealthOrchestrator:
             patient = db.get_patient(self.patient_id)
             if patient:
                 patient_context = (
-                    f"\nThong tin benh nhan da biet:\n"
-                    f"- Ten: {patient.get('name', 'N/A')}\n"
-                    f"- Tuoi: {patient.get('age', 'N/A')}\n"
-                    f"- Gioi: {patient.get('gender', 'N/A')}\n"
-                    f"- Tien su: {patient.get('medical_history', 'N/A')}\n"
-                    f"- Di ung: {patient.get('allergies', 'N/A')}\n"
-                    f"- Thuoc hien tai: {patient.get('current_medications', 'N/A')}\n"
+                    f"\nThông tin bệnh nhân đã biết:\n"
+                    f"- Tên: {patient.get('name', 'N/A')}\n"
+                    f"- Tuổi: {patient.get('age', 'N/A')}\n"
+                    f"- Giới: {patient.get('gender', 'N/A')}\n"
+                    f"- Tiền sử: {patient.get('medical_history', 'N/A')}\n"
+                    f"- Dị ứng: {patient.get('allergies', 'N/A')}\n"
+                    f"- Thuốc hiện tại: {patient.get('current_medications', 'N/A')}\n"
                 )
 
         response = _call_claude(
             system_prompt=(
                 f"{consultant.SYSTEM_PROMPT}\n\n"
-                "## HUONG DAN TUONG TAC VOI BENH NHAN\n"
-                "Ban co tool `ask_patient` de hoi benh nhan truc tiep qua Telegram.\n"
-                "- Neu CAN THEM thong tin: goi ask_patient(question='cau hoi cua ban')\n"
-                "- Session ID tu dong - KHONG can truyen session_id.\n"
-                f"- Toi da {self.MAX_INTERVIEW_TURNS} lan hoi.\n"
-                "- Hoi TU NHIEN nhu bac si, KHONG hoi kieu checklist.\n"
-                "- Xung ho Toi/Ban. Neu biet gioi tinh: dung anh/chi thay cho ban.\n"
-                "- KHONG dung con/thay.\n\n"
-                "## KHI DU THONG TIN\n"
-                "Khi da du thong tin (trieu chung, thoi gian, muc do, tien su co ban):\n"
-                "- Bat dau response voi [INTAKE_COMPLETE]\n"
-                "- Tiep theo la YAML patient_profile\n\n"
-                "## LUU Y\n"
-                "- Neu benh nhan khong tra loi (timeout), tiep tuc voi thong tin da co.\n"
-                "- Cuoi cung PHAI output [INTAKE_COMPLETE] + profile."
+                "## CACH TUONG TAC\n"
+                "Ban KHONG co tool. KHONG goi ask_patient hay bat ky tool nao.\n"
+                "Thay vao do:\n\n"
+                "NEU CAN HOI THEM benh nhan (thieu thong tin trieu chung, thoi gian, muc do...):\n"
+                "- Bat dau voi loi chao/empathy ngan gon (1 cau)\n"
+                "- Sau do output tag [QUESTIONS]\n"
+                "- Liet ke cac cau hoi (toi da 3), moi cau 1 dong\n"
+                "- Neu cau hoi co lua chon, them OPTIONS: a|b|c|d\n"
+                "Vi du:\n"
+                "[QUESTIONS]\n"
+                "Trieu chung nay xuat hien tu bao lau? OPTIONS: Hom nay|Vai ngay|Vai tuan|Hon 1 thang\n"
+                "Muc do dau hien tai? OPTIONS: Nhe|Vua|Nang|Rat nang\n"
+                "Ban co tien su benh gi khong?\n\n"
+                "NEU DA DU thong tin (trieu chung, thoi gian, muc do, tien su co ban):\n"
+                "- Output [INTAKE_COMPLETE]\n"
+                "- Tiep theo YAML patient_profile\n\n"
+                "Xung ho Toi/Ban. Than thien nhu bac si.\n"
+                "KHONG dung con/thay."
             ),
             user_prompt=(
                 f"{user_memory}\n{patient_context}\n"
-                f"Benh nhan gui tin nhan:\n{patient_message}\n\n"
-                "Bat dau interview. Neu can hoi them, dung tool ask_patient(question='...'). "
-                "Khi du thong tin, output [INTAKE_COMPLETE] + YAML profile."
+                f"Benh nhan gui tin nhan: {patient_message}\n\n"
+                "Phan tich va quyet dinh: du thong tin ([INTAKE_COMPLETE]) "
+                "hay can hoi them ([QUESTIONS])?"
             ),
-            allowed_tools=["mcp__jiva_health__ask_patient"],
-            session_id=session_id,
         )
 
-        return response
+        if "[INTAKE_COMPLETE]" in response:
+            return {"complete": True, "response": response}
+
+        if "[QUESTIONS]" in response:
+            # Split greeting from questions
+            parts = response.split("[QUESTIONS]", 1)
+            greeting = parts[0].strip() if parts[0].strip() else ""
+            questions_text = parts[1].strip() if len(parts) > 1 else ""
+            return {
+                "complete": False,
+                "questions": questions_text,
+                "greeting": greeting,
+            }
+
+        # Fallback: treat as complete (Claude didn't follow format)
+        return {"complete": True, "response": response}
+
+    def continue_with_answers(self, original_message: str, answers: str) -> dict:
+        """Continue consultation after patient answered interview questions.
+
+        Args:
+            original_message: Patient's initial message
+            answers: Patient's answers to interview questions
+
+        Returns: Full analysis result (same as _run_analysis_phase output)
+        """
+        # User memory
+        user_memory = ""
+        if self.user_id:
+            user_memory = db.get_user_context_summary(self.user_id)
+
+        # Patient context
+        patient_context = ""
+        if self.patient_id:
+            patient = db.get_patient(self.patient_id)
+            if patient:
+                patient_context = (
+                    f"\nThong tin benh nhan:\n"
+                    f"- Tên: {patient.get('name', 'N/A')}\n"
+                    f"- Tuổi: {patient.get('age', 'N/A')}\n"
+                    f"- Giới: {patient.get('gender', 'N/A')}\n"
+                )
+
+        # Get the questions that were asked
+        interview_qs = self.consultation.get("interview_questions", "")
+
+        response = _call_claude(
+            system_prompt=(
+                f"{consultant.SYSTEM_PROMPT}\n\n"
+                "Benh nhan da tra loi cac cau hoi cua ban.\n"
+                "BAT BUOC output [INTAKE_COMPLETE] sau do la YAML patient_profile day du.\n"
+                "Xung ho Toi/Ban."
+            ),
+            user_prompt=(
+                f"{user_memory}\n{patient_context}\n"
+                f"Benh nhan ban dau noi: {original_message}\n\n"
+                f"Cac cau hoi da hoi:\n{interview_qs}\n\n"
+                f"Tra loi cua benh nhan: {answers}\n\n"
+                "Tao Patient Profile YAML day du. Bat dau voi [INTAKE_COMPLETE]."
+            ),
+        )
+
+        self.consultation["patient_profile"] = {
+            "raw_message": original_message,
+            "extracted": response,
+        }
+        self.interview_history.append({"role": "user", "content": answers})
+        self._extract_and_save_facts(response, f"{original_message}\n{answers}")
+
+        if self._db_consultation:
+            db.update_consultation(
+                self.consultation["id"],
+                patient_profile=response,
+            )
+            db.save_message(
+                user_id=self.user_id, role="user", content=answers,
+                consultation_id=self._db_consultation["id"],
+            )
+
+        self._notify("interview", "done")
+        return self._run_analysis_phase()
 
     def _interview_step(self, latest_message: str) -> str | None:
         """Legacy: Ask Claude consultant without MCP tool (fallback).
@@ -414,7 +549,7 @@ class HealthOrchestrator:
         # Build conversation context
         convo_text = ""
         for msg in self.interview_history:
-            role_label = "Benh nhan" if msg["role"] == "user" else "Jiva Health"
+            role_label = "Bệnh nhân" if msg["role"] == "user" else "Jiva Health"
             convo_text += f"{role_label}: {msg['content']}\n\n"
 
         # Patient context from DB
@@ -423,31 +558,31 @@ class HealthOrchestrator:
             patient = db.get_patient(self.patient_id)
             if patient:
                 patient_context = (
-                    f"\nThong tin benh nhan da biet:\n"
-                    f"- Ten: {patient.get('name', 'N/A')}\n"
-                    f"- Tuoi: {patient.get('age', 'N/A')}\n"
-                    f"- Gioi: {patient.get('gender', 'N/A')}\n"
-                    f"- Tien su: {patient.get('medical_history', 'N/A')}\n"
-                    f"- Di ung: {patient.get('allergies', 'N/A')}\n"
-                    f"- Thuoc hien tai: {patient.get('current_medications', 'N/A')}\n"
+                    f"\nThông tin bệnh nhân đã biết:\n"
+                    f"- Tên: {patient.get('name', 'N/A')}\n"
+                    f"- Tuổi: {patient.get('age', 'N/A')}\n"
+                    f"- Giới: {patient.get('gender', 'N/A')}\n"
+                    f"- Tiền sử: {patient.get('medical_history', 'N/A')}\n"
+                    f"- Dị ứng: {patient.get('allergies', 'N/A')}\n"
+                    f"- Thuốc hiện tại: {patient.get('current_medications', 'N/A')}\n"
                 )
 
         response = _call_claude(
             system_prompt=(
                 f"{consultant.SYSTEM_PROMPT}\n\n"
-                "## Luu y QUAN TRONG\n"
-                "- Xung ho Toi/Ban (KHONG dung con/thay)\n"
-                "- Neu DA DU thong tin (trieu chung, thoi gian, muc do, tien su co ban): "
-                "bat dau response voi [INTAKE_COMPLETE] roi xuat YAML profile.\n"
-                "- Neu CHUA DU: hoi them 1-2 cau ngan gon, than thien. "
-                "KHONG hoi kieu checklist. Hoi TU NHIEN nhu bac si.\n"
-                f"- Day la luot hoi thu {self.interview_turn + 1}/{self.MAX_INTERVIEW_TURNS}. "
-                f"{'Neu la luot cuoi, hay ket thuc voi [INTAKE_COMPLETE].' if self.interview_turn + 1 >= self.MAX_INTERVIEW_TURNS else ''}"
+                "## Lưu ý QUAN TRỌNG\n"
+                "- Xưng hô Tôi/Bạn (KHÔNG dùng con/thầy)\n"
+                "- Nếu ĐÃ ĐỦ thông tin (triệu chứng, thời gian, mức độ, tiền sử cơ bản): "
+                "bắt đầu response với [INTAKE_COMPLETE] rồi xuất YAML profile.\n"
+                "- Nếu CHƯA ĐỦ: hỏi thêm 1-2 câu ngắn gọn, thân thiện. "
+                "KHÔNG hỏi kiểu checklist. Hỏi TỰ NHIÊN như bác sĩ.\n"
+                f"- Đây là lượt hỏi thứ {self.interview_turn + 1}/{self.MAX_INTERVIEW_TURNS}. "
+                f"{'Nếu là lượt cuối, hãy kết thúc với [INTAKE_COMPLETE].' if self.interview_turn + 1 >= self.MAX_INTERVIEW_TURNS else ''}"
             ),
             user_prompt=(
                 f"{patient_context}\n"
-                f"Cuoc hoi thoai:\n{convo_text}\n"
-                "Tiep tuc hoi thoai hoac [INTAKE_COMPLETE] neu du thong tin."
+                f"Cuộc hỏi thoại:\n{convo_text}\n"
+                "Tiếp tục hỏi thoại hoặc [INTAKE_COMPLETE] nếu đủ thông tin."
             ),
         )
 
@@ -575,6 +710,23 @@ class HealthOrchestrator:
                 content=self.consultation["handoff"],
                 consultation_id=self._db_consultation["id"],
             )
+
+        # Sync to Jiva core memory (5W1H)
+        if HAS_MEMORY_BRIDGE:
+            try:
+                user_data = None
+                patient_data = None
+                if self.user_id:
+                    user_row = db.get_db().execute(
+                        "SELECT * FROM users WHERE id = ?", (self.user_id,)
+                    ).fetchone()
+                    if user_row:
+                        user_data = dict(user_row)
+                if self.patient_id:
+                    patient_data = db.get_patient(self.patient_id)
+                sync_consultation_to_core(self.consultation, user_data, patient_data)
+            except Exception:
+                pass  # Don't let sync errors break the workflow
 
         return {
             "id": consultation_id,
@@ -742,13 +894,13 @@ class HealthOrchestrator:
             patient = db.get_patient(self.patient_id)
             if patient:
                 patient_context = (
-                    f"\nThong tin benh nhan da biet:\n"
-                    f"- Ten: {patient.get('name', 'N/A')}\n"
-                    f"- Tuoi: {patient.get('age', 'N/A')}\n"
-                    f"- Gioi: {patient.get('gender', 'N/A')}\n"
-                    f"- Tien su: {patient.get('medical_history', 'N/A')}\n"
-                    f"- Di ung: {patient.get('allergies', 'N/A')}\n"
-                    f"- Thuoc hien tai: {patient.get('current_medications', 'N/A')}\n"
+                    f"\nThông tin bệnh nhân đã biết:\n"
+                    f"- Tên: {patient.get('name', 'N/A')}\n"
+                    f"- Tuổi: {patient.get('age', 'N/A')}\n"
+                    f"- Giới: {patient.get('gender', 'N/A')}\n"
+                    f"- Tiền sử: {patient.get('medical_history', 'N/A')}\n"
+                    f"- Dị ứng: {patient.get('allergies', 'N/A')}\n"
+                    f"- Thuốc hiện tại: {patient.get('current_medications', 'N/A')}\n"
                 )
 
         # Include recent consultation history
@@ -776,7 +928,7 @@ class HealthOrchestrator:
         return {"raw_message": message, "extracted": response}
 
     def _run_research(self, profile: dict) -> str:
-        """Step 2: Research medical literature."""
+        """Step 2: Research medical literature (with WebSearch!)."""
         messages = research.build_research_prompt(profile)
         system_msg = messages[0]["content"]
         user_msg = messages[1]["content"]
@@ -785,23 +937,29 @@ class HealthOrchestrator:
         kb_entries = db.get_knowledge(limit=20)
         if kb_entries:
             kb_text = "\n".join(f"- {e['content']}" for e in kb_entries)
-            user_msg += f"\n\nKnowledge Base (thong tin bo sung tu chuyen gia):\n{kb_text}"
+            user_msg += f"\n\nKnowledge Base (thông tin bổ sung từ chuyên gia):\n{kb_text}"
 
-        return _call_claude(system_prompt=system_msg, user_prompt=user_msg, model="haiku")
+        # Research MUST have WebSearch to look up medical info
+        return _call_claude(
+            system_prompt=system_msg,
+            user_prompt=user_msg,
+            model="sonnet",
+            allowed_tools=["WebSearch", "WebFetch"],
+        )
 
     def _run_eval(self, profile: dict, research_result: str) -> str:
         """Step 3 & 4.5: Status Assessment + Treatment ABCEF."""
         messages = evaluator.build_eval_prompt(profile, research_result)
         system_msg = messages[0]["content"]
         user_msg = messages[1]["content"]
-        return _call_claude(system_prompt=system_msg, user_prompt=user_msg, model="haiku")
+        return _call_claude(system_prompt=system_msg, user_prompt=user_msg, model="sonnet")
 
     def _run_causes(self, profile: dict, research_result: str) -> str:
         """Step 4: Causal chain analysis."""
         messages = causes.build_causes_prompt(profile, research_result)
         system_msg = messages[0]["content"]
         user_msg = messages[1]["content"]
-        return _call_claude(system_prompt=system_msg, user_prompt=user_msg, model="haiku")
+        return _call_claude(system_prompt=system_msg, user_prompt=user_msg, model="sonnet")
 
     def _run_solutions(
         self, profile: dict, research_result: str,
@@ -813,7 +971,7 @@ class HealthOrchestrator:
         )
         system_msg = messages[0]["content"]
         user_msg = messages[1]["content"]
-        return _call_claude(system_prompt=system_msg, user_prompt=user_msg, model="haiku")
+        return _call_claude(system_prompt=system_msg, user_prompt=user_msg, model="sonnet")
 
     def _synthesize_report(self) -> str:
         """Step 6: Generate bilingual consultation report."""
@@ -850,7 +1008,7 @@ Tao bao cao theo template:
 
 ## 1. TONG QUAN / OVERVIEW
 ## 2. PHAN TICH NGUYEN NHAN / CAUSAL ANALYSIS
-## 3. THONG TIN Y KHOA / MEDICAL INFO
+## 3. THÔNG TIN Y KHOA / MEDICAL INFO
 ## 4. PHUONG AN THAM KHAO / RECOMMENDATIONS
 ## 5. DANH GIA PHAC DO (ABCEF) / TREATMENT EVALUATION
 ## 6. HUONG DAN CHAM SOC / CARE GUIDE
@@ -910,7 +1068,7 @@ if __name__ == "__main__":
     else:
         msg = input("Mo ta trieu chung/tinh trang: ")
 
-    print("\nDang tu van...\n")
+    print("\nĐang tư vấn...\n")
     result = run_consultation(msg)
 
     if result.get("emergency"):
